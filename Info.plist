@@ -3,17 +3,19 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleExecutable</key>
-    <string>MeetingScribe</string>
+    <string>Humdrum</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
-    <string>com.aaronellis.meetingscribe</string>
+    <string>com.aaronellis.humdrum</string>
     <key>CFBundleName</key>
-    <string>MeetingScribe</string>
+    <string>Humdrum</string>
     <key>CFBundleDisplayName</key>
-    <string>Meeting Scribe</string>
+    <string>Humdrum</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>0.2.0</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>2</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundlePackageType</key>
@@ -27,7 +29,7 @@
     <key>NSHighResolutionCapable</key>
     <true/>
     <key>NSMicrophoneUsageDescription</key>
-    <string>Meeting Scribe records audio from your microphone to produce a local, on-device transcript. Audio never leaves your Mac.</string>
+    <string>Humdrum records audio from your microphone to produce a local, on-device transcript. Audio never leaves your Mac.</string>
     <key>NSSupportsAutomaticTermination</key>
     <false/>
     <key>NSSupportsSuddenTermination</key>

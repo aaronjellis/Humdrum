@@ -1,12 +1,13 @@
-# Meeting Scribe
+# Humdrum
 
-A lightweight, **100% local**, native SwiftUI Mac app that records your microphone and produces a live transcript you can copy or save. Nothing leaves your machine.
+A lightweight, **100% local**, native SwiftUI Mac app that records your microphone and produces a live transcript you can copy or save. Also a global dictation hotkey (⌥Space) that pastes Whisper transcriptions into whatever field you're typing in. Nothing leaves your machine.
 
 - Native Swift / SwiftUI — no Electron, no browser
 - Local transcription via [WhisperKit](https://github.com/argmaxinc/WhisperKit) (Whisper compiled to Core ML, runs on the Apple Neural Engine)
 - Live / streaming UI: confirmed text in black, in-flight hypothesis in gray italic
 - Pick your model: Tiny → Base → Small → Medium (accuracy vs. speed)
-- Copy to clipboard, Save as `.txt`
+- Global ⌥Space dictation — speak, text appears in the focused field
+- Copy to clipboard, Save as `.txt` / `.md` / `.rtf` / `.json`, or auto-save to a folder
 - Real local speaker diarization via [FluidAudio](https://github.com/FluidInference/FluidAudio) (pyannote-segmentation + speaker-embedding models in Core ML). Runs once when you click Stop.
 - Adjustable noise filter (Off / Light / Normal / Strict) to keep Whisper from hallucinating "Thanks for watching" during silent stretches.
 
@@ -23,24 +24,36 @@ A lightweight, **100% local**, native SwiftUI Mac app that records your micropho
 ## Quick start
 
 ```bash
-cd MeetingScribe
-./build-app.sh
-open ./MeetingScribe.app
+cd Humdrum
+./build-app.sh --skip-notarize   # fast dev build
+open ./Humdrum.app
 ```
 
 On first launch:
 
-1. macOS will ask for Microphone permission — approve it.
-2. The app will download the selected Whisper model from Hugging Face (progress shown in the status bar). Subsequent launches are instant.
-3. Click **Start Recording**, speak, click **Stop**. Use **Copy** to grab the transcript.
+1. Humdrum will offer to move itself into `/Applications` — accept it so TCC permissions stick.
+2. macOS will ask for Microphone permission — approve it.
+3. Grant Accessibility in System Settings → Privacy & Security → Accessibility (needed for ⌥Space dictation to paste into other apps).
+4. The app downloads the selected Whisper model from Hugging Face on first use. Subsequent launches are instant.
 
-### Or run from source without building a bundle
+### Shipping to someone else
+
+Run the full release pipeline (signs with Developer ID, enables hardened runtime, notarizes with Apple, and staples the ticket onto the bundle):
 
 ```bash
-swift run -c release
+./build-app.sh
 ```
 
-This skips the `.app` wrapper. macOS may show a generic permission prompt or the prompt may not appear cleanly — `./build-app.sh` is the recommended path.
+Hand over the resulting `Humdrum.zip`. They unzip, drag `Humdrum.app` into `/Applications`, and launch normally — no right-click-open dance, no Gatekeeper warnings.
+
+One-time setup for notarization (see `build-app.sh` header for the full list):
+
+```bash
+xcrun notarytool store-credentials humdrum-notary \
+    --apple-id "you@example.com" \
+    --team-id  "YOUR_TEAM_ID" \
+    --password "xxxx-xxxx-xxxx-xxxx"   # app-specific password from appleid.apple.com
+```
 
 ---
 
@@ -66,6 +79,16 @@ This skips the `.app` wrapper. macOS may show a generic permission prompt or the
 - If the commit was triggered by a long silence and speaker labeling is on, we toggle `Speaker 1` / `Speaker 2`.
 
 This is a pragmatic streaming scheme: latency is bounded by the transcription interval (~1.5 s) and the commit window. Accuracy is close to batch mode because each commit always has full sentence context.
+
+## Dictation (⌥Space)
+
+`DictationCoordinator.swift` wraps the same transcription pipeline for a "paste as you speak" flow:
+
+1. ⌥Space → a floating glass-orb visualizer appears, the mic starts listening, and whichever field had focus in the frontmost app keeps focus (the orb's NSPanel is non-activating).
+2. As Whisper commits chunks, `PasteHelper` inserts them into the focused field — first via the Accessibility API (`kAXSelectedTextAttribute`), falling back to synthesized ⌘V through the HID event tap when AX insertion isn't supported.
+3. 2.5 s of silence (configurable in Settings) or another ⌥Space stops dictation and hides the orb.
+
+If Accessibility permission is missing, the orb still runs but each chunk only lands on the clipboard — a red warning pill appears under the orb so the failure mode isn't silent.
 
 ## Quality levels
 
@@ -98,6 +121,10 @@ Why post-processing instead of live labels? Streaming diarization that keeps spe
 
 Delay on Stop is roughly 2–6 s per minute of audio on Apple Silicon. First ever run downloads the diarization models (~80 MB) to `~/Library/Caches` and then caches them forever.
 
+## Auto-save
+
+Settings → Transcripts lets you pick a default folder and format, and toggle **Save to default folder automatically**. When that toggle is on, finished recordings are written to the folder immediately — no Save dialog — with filename collisions resolved by appending `-1`, `-2`, etc. The in-app session still exists, so Save… from the detail view remains available.
+
 ## Known limitations
 
 - **Microphone only.** Capturing system audio (e.g., Zoom's far-side audio) needs a virtual audio driver like [BlackHole](https://github.com/ExistentialAudio/BlackHole) or a multi-output device. You then select that device as your system mic before starting. The app itself needs no change.
@@ -107,27 +134,48 @@ Delay on Stop is roughly 2–6 s per minute of audio on Apple Silicon. First eve
 
 ## Keyboard shortcuts
 
-- `⌘R` — Start / Stop recording
+- `⌥Space` — Start / stop dictation (global)
+- `⌘R` — Start / stop recording (in-app)
 - `⌘⇧C` — Copy transcript
 - `⌘S` — Save transcript
 
 ## Project layout
 
 ```
-MeetingScribe/
-├── Package.swift                              Swift package, depends on WhisperKit
-├── Info.plist                                 Bundle metadata + mic permission copy
-├── build-app.sh                               Builds & wraps into MeetingScribe.app
+Humdrum/
+├── Package.swift                               Swift package, depends on WhisperKit + FluidAudio
+├── Info.plist                                  Bundle metadata + mic permission copy
+├── Humdrum.entitlements                        Hardened-runtime + mic entitlements
+├── build-app.sh                                Builds, signs, notarizes, staples, zips
 ├── README.md
-└── Sources/MeetingScribe/
-    ├── MeetingScribeApp.swift                 @main entry, window setup
-    ├── ContentView.swift                      SwiftUI UI (header, controls, transcript, footer)
-    └── TranscriptionManager.swift             Audio capture + streaming transcription logic
+└── Sources/Humdrum/
+    ├── HumdrumApp.swift                        @main entry, window setup
+    ├── AppState.swift                          Shared state, auto-save, diarization worker
+    ├── ContentView.swift                       Main SwiftUI window
+    ├── DictationCoordinator.swift              ⌥Space dictation orchestration
+    ├── DictationOverlay.swift                  Floating non-activating orb panel
+    ├── AudioVisualizer.swift                   Glass-sphere visualizer
+    ├── PasteHelper.swift                       AX-insert / ⌘V paste strategies
+    ├── MoveToApplications.swift                First-launch move prompt
+    ├── UserDefaultsMigrator.swift              Legacy "MeetingScribe.*" key migration
+    ├── TranscriptExporter.swift                Shared save logic (.txt/.md/.rtf/.json)
+    ├── SessionStore.swift                      Persisted transcript store
+    ├── SettingsView.swift                      ⌘, Settings window
+    └── TranscriptionManager.swift              Audio capture + streaming transcription
 ```
 
 ## Troubleshooting
 
-**"Could not start mic…"** — Open `System Settings → Privacy & Security → Microphone` and tick `MeetingScribe`. If it isn't listed, delete `MeetingScribe.app`, run `./build-app.sh` again, and relaunch.
+**"Could not start mic…"** — Open `System Settings → Privacy & Security → Microphone` and tick `Humdrum`. If it isn't listed, delete `Humdrum.app`, run `./build-app.sh` again, and relaunch.
+
+**Dictation orb bounces but no text appears** — Accessibility permission is missing or stale. Settings → Dictation → "Reset & Re-grant…". Rebuilding an ad-hoc-signed app changes the binary signature, which can invalidate the existing TCC row.
+
+**Notarization failed** — Get the full log:
+```bash
+xcrun notarytool history --keychain-profile humdrum-notary
+xcrun notarytool log <submission-id> --keychain-profile humdrum-notary
+```
+Most common causes: an entitlement that requires a provisioning profile you don't have, or unsigned binaries inside an SPM `.bundle`. The build script walks and pre-signs nested dylibs/frameworks/bundles specifically to avoid this.
 
 **Model download stuck** — WhisperKit caches models under `~/Library/Caches/com.argmax.whisperkit` (or similar). Delete that folder and reload to retry.
 

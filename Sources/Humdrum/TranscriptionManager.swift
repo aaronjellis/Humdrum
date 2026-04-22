@@ -154,6 +154,30 @@ final class TranscriptionManager: ObservableObject {
     @Published var speakerLabelsEnabled: Bool = false
     @Published var noiseFilterLevel: NoiseFilterLevel = .normal
 
+    // MARK: Audio input selection
+    //
+    // Global mic choice, shared by meeting recording AND standalone
+    // dictation. `nil` means "use the macOS system-default input" —
+    // which is the right default behavior for fresh installs and
+    // keeps us out of CoreAudio state when the user is happy with
+    // their OS setting.
+    //
+    // The DeviceID type is WhisperKit's alias for CoreAudio's
+    // AudioDeviceID (UInt32). We store it in UserDefaults as Int so
+    // the plist round-trip is boring.
+    @Published var availableInputDevices: [AudioDevice] = []
+    @Published var selectedInputDeviceID: DeviceID? = nil {
+        didSet {
+            let defaults = UserDefaults.standard
+            if let id = selectedInputDeviceID {
+                defaults.set(Int(id), forKey: Self.selectedInputDeviceKey)
+            } else {
+                defaults.removeObject(forKey: Self.selectedInputDeviceKey)
+            }
+        }
+    }
+    private static let selectedInputDeviceKey = "Humdrum.audio.selectedInputDeviceID"
+
     @Published var elapsedSeconds: Int = 0
 
     /// Three audio RMS levels (0...~1.1), with progressively slower smoothing
@@ -199,6 +223,41 @@ final class TranscriptionManager: ObservableObject {
     private var cachedHintText: String = ""
     private var cachedPromptTokens: [Int]?
 
+    // MARK: Init
+
+    init() {
+        // Hydrate the persisted mic selection BEFORE the first refresh
+        // so the picker lands on the user's last choice on launch. If
+        // the stored ID no longer exists (device unplugged since last
+        // run), refreshInputDevices() will quietly fall back to nil —
+        // meaning "system default" — rather than stranding the user
+        // on a phantom device.
+        if let raw = UserDefaults.standard.object(forKey: Self.selectedInputDeviceKey) as? Int {
+            selectedInputDeviceID = DeviceID(raw)
+        }
+        refreshInputDevices()
+    }
+
+    // MARK: Audio input devices
+
+    /// Re-enumerate the system's audio input devices and prune a
+    /// stale selection. Call on init, whenever Settings is opened,
+    /// and before starting a recording — CoreAudio doesn't give us a
+    /// cheap "device list changed" notification we can rely on, so
+    /// re-scanning on demand is the simplest safe option.
+    func refreshInputDevices() {
+        let devices = AudioProcessor.getAudioDevices()
+        availableInputDevices = devices
+        // If the previously-selected device is no longer attached
+        // (unplugged USB mic, Bluetooth disconnected), drop the
+        // selection back to "system default" rather than silently
+        // letting WhisperKit fail to find it at start time.
+        if let id = selectedInputDeviceID,
+           !devices.contains(where: { $0.id == id }) {
+            selectedInputDeviceID = nil
+        }
+    }
+
     // MARK: Model lifecycle
 
     func loadModel() async {
@@ -243,7 +302,7 @@ final class TranscriptionManager: ObservableObject {
     // MARK: Recording lifecycle
 
     func start() async {
-        guard modelLoaded, let audioProcessor else {
+        guard modelLoaded else {
             status = "Model not loaded yet."
             return
         }
@@ -264,12 +323,29 @@ final class TranscriptionManager: ObservableObject {
 
         let granted = await ensureMicrophoneAccess()
         guard granted else {
-            status = "Microphone access denied. Open System Settings → Privacy & Security → Microphone, enable Meeting Scribe, then try again. If it isn't listed, run: tccutil reset Microphone com.aaronellis.meetingscribe"
+            status = "Microphone access denied. Open System Settings → Privacy & Security → Microphone, enable Humdrum, then try again. If it isn't listed, run: tccutil reset Microphone com.aaronellis.humdrum"
             return
         }
 
+        // Recreate the AudioProcessor on every start so its rolling
+        // `audioSamples` buffer begins empty. Without this, a second
+        // session inherits every float from the previous one — the
+        // transcription loop then dutifully re-runs Whisper on all
+        // that stale audio before catching up to current speech,
+        // which presents to the user as a multi-minute hang on the
+        // second (or Nth) recording. Cheap to recreate; WhisperKit's
+        // AudioProcessor is a thin AVAudioEngine wrapper.
+        audioProcessor?.stopRecording()
+        let processor = AudioProcessor()
+        self.audioProcessor = processor
+
+        // Re-probe the device list so a stale pick made while the
+        // device was unplugged gets cleared before we hand the ID
+        // off to AudioProcessor (which would otherwise error out).
+        refreshInputDevices()
+
         do {
-            try audioProcessor.startRecordingLive { _ in }
+            try processor.startRecordingLive(inputDeviceID: selectedInputDeviceID) { _ in }
             commitSampleIndex = 0
             commits = []
             confirmedText = ""

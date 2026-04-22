@@ -62,8 +62,26 @@ final class AppState: ObservableObject {
         }
     }
 
-    private static let defaultSaveFolderKey = "MeetingScribe.defaultSaveFolder"
-    private static let defaultSaveFormatKey = "MeetingScribe.defaultSaveFormat"
+    /// When true, completed recordings are written to
+    /// `defaultSaveFolderPath` in `defaultSaveFormat` immediately after
+    /// the in-app session is saved — no Save panel, no extra clicks.
+    /// A no-op when no default folder is set, so turning this on without
+    /// configuring a folder is safe (it just silently waits).
+    @Published var autoSaveOnRecordEnd: Bool {
+        didSet {
+            UserDefaults.standard.set(autoSaveOnRecordEnd, forKey: Self.autoSaveOnRecordEndKey)
+        }
+    }
+
+    /// The last file written by the auto-save path, if any. Used to
+    /// show a short confirmation line in the detail view ("Saved to
+    /// ~/Documents/Transcripts/foo.md") without the user having to dig
+    /// for it in Finder.
+    @Published private(set) var lastAutoSaveURL: URL?
+
+    private static let defaultSaveFolderKey = "Humdrum.defaultSaveFolder"
+    private static let defaultSaveFormatKey = "Humdrum.defaultSaveFormat"
+    private static let autoSaveOnRecordEndKey = "Humdrum.autoSaveOnRecordEnd"
 
     init() {
         // Hydrate preferences up front so the very first Settings open
@@ -72,6 +90,10 @@ final class AppState: ObservableObject {
         self.defaultSaveFolderPath = defaults.string(forKey: Self.defaultSaveFolderKey)
         let storedFormat = defaults.string(forKey: Self.defaultSaveFormatKey)
         self.defaultSaveFormat = storedFormat.flatMap { SaveFormat(rawValue: $0) } ?? .txt
+        // Default OFF — opt-in so a user who's never configured a
+        // folder doesn't get surprised by files appearing somewhere.
+        self.autoSaveOnRecordEnd =
+            defaults.object(forKey: Self.autoSaveOnRecordEndKey) as? Bool ?? false
     }
 
     // MARK: - Private
@@ -117,6 +139,13 @@ final class AppState: ObservableObject {
         store.save(session)
         selection = .session(session.id)
 
+        // Fire-and-forget auto-save to the user's chosen folder. Only
+        // runs when the toggle is on AND a folder has been configured —
+        // either being missing is a silent no-op, so you can turn the
+        // toggle on before picking a folder (or vice versa) without
+        // losing data.
+        autoSaveIfEnabled(session: session)
+
         if snap.speakerLabelsEnabled,
            !snap.audioSamples.isEmpty,
            !snap.commits.isEmpty {
@@ -135,9 +164,68 @@ final class AppState: ObservableObject {
         }
     }
 
+    // MARK: - Auto-save
+
+    /// If the user has auto-save turned on AND picked a default folder,
+    /// write the freshly-completed transcript there. Any failure is
+    /// surfaced via a non-blocking alert so the user sees *why* the
+    /// file didn't appear, rather than silently losing the output.
+    private func autoSaveIfEnabled(session: TranscriptSession) {
+        guard autoSaveOnRecordEnd else { return }
+        guard let folder = defaultSaveFolderURL else { return }
+
+        // Refuse empty transcripts — same rule as the detail view's
+        // Save… button. The in-app session is already persisted;
+        // writing a zero-byte file to the user's folder would be noise.
+        guard !session.transcriptText
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .isEmpty
+        else { return }
+
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: folder.path) {
+            autoSaveFailureAlert(
+                reason: "The folder \(folder.path) no longer exists. "
+                        + "Pick a new default folder in Settings → Transcripts."
+            )
+            return
+        }
+
+        let format = defaultSaveFormat
+        let url = TranscriptExporter.uniqueAutosaveURL(
+            for: session,
+            format: format,
+            in: folder
+        )
+
+        do {
+            try TranscriptExporter.write(session: session, format: format, to: url)
+            lastAutoSaveURL = url
+        } catch {
+            autoSaveFailureAlert(reason: error.localizedDescription)
+        }
+    }
+
+    private func autoSaveFailureAlert(reason: String) {
+        let alert = NSAlert()
+        alert.messageText = "Couldn't auto-save transcript"
+        alert.informativeText = reason
+            + "\n\nThe transcript is still available in the app — just click Save… to save it manually."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "OK")
+        alert.addButton(withTitle: "Open Settings…")
+        if alert.runModal() == .alertSecondButtonReturn {
+            NSApp.sendAction(
+                Selector(("showSettingsWindow:")),
+                to: nil,
+                from: nil
+            )
+        }
+    }
+
     // MARK: - Diarization download consent
 
-    private static let consentKey = "MeetingScribe.diarization.consentedV1"
+    private static let consentKey = "Humdrum.diarization.consentedV1"
 
     private static func diarizationConsented() -> Bool {
         UserDefaults.standard.bool(forKey: consentKey)

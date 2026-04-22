@@ -2,12 +2,12 @@
 import PackageDescription
 
 let package = Package(
-    name: "MeetingScribe",
+    name: "Humdrum",
     platforms: [
         .macOS(.v14)
     ],
     products: [
-        .executable(name: "MeetingScribe", targets: ["MeetingScribe"])
+        .executable(name: "Humdrum", targets: ["Humdrum"])
     ],
     dependencies: [
         // WhisperKit: Apple-Silicon–optimized, 100% local Whisper transcription (MIT).
@@ -21,12 +21,12 @@ let package = Package(
     ],
     targets: [
         .executableTarget(
-            name: "MeetingScribe",
+            name: "Humdrum",
             dependencies: [
                 .product(name: "WhisperKit", package: "WhisperKit"),
                 .product(name: "FluidAudio", package: "FluidAudio")
             ],
-            path: "Sources/MeetingScribe"
+            path: "Sources/Humdrum"
         )
     ]
 )

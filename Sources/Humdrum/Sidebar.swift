@@ -47,7 +47,7 @@ struct Sidebar: View {
             }
 
             VStack(alignment: .leading, spacing: 1) {
-                Text("Meeting Scribe")
+                Text("Humdrum")
                     .font(.system(size: 14.5, weight: .semibold))
                     .foregroundStyle(AppTheme.textPrimary)
                 Text("Local transcripts")

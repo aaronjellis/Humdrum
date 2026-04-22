@@ -477,7 +477,7 @@ struct SetupWindow: View {
         let alert = NSAlert()
         alert.messageText = "Download the \(q.shortLabel) transcription model?"
         alert.informativeText = """
-            Meeting Scribe needs to fetch the Whisper \(q.shortLabel) model (\(q.sizeDescription)) \
+            Humdrum needs to fetch the Whisper \(q.shortLabel) model (\(q.sizeDescription)) \
             from Hugging Face the first time you use it. Saved to \
             ~/Documents/huggingface/models — cached forever after, runs entirely on-device. \
             No other network access.

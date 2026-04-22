@@ -65,9 +65,20 @@ final class SessionStore: ObservableObject {
                                       appropriateFor: nil,
                                       create: true))
             ?? URL(fileURLWithPath: NSHomeDirectory() + "/Library/Application Support")
-        let dir = appSupport
-            .appendingPathComponent("MeetingScribe", isDirectory: true)
-            .appendingPathComponent("sessions", isDirectory: true)
+        let root = appSupport.appendingPathComponent("Humdrum", isDirectory: true)
+
+        // One-time migration from the old "MeetingScribe" folder so users
+        // who recorded under the previous name don't see their session
+        // history disappear after the rebuild. The moveItem call is a
+        // no-op if the old folder doesn't exist or the new one is
+        // already populated.
+        let legacy = appSupport.appendingPathComponent("MeetingScribe", isDirectory: true)
+        if fm.fileExists(atPath: legacy.path),
+           !fm.fileExists(atPath: root.path) {
+            try? fm.moveItem(at: legacy, to: root)
+        }
+
+        let dir = root.appendingPathComponent("sessions", isDirectory: true)
         try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
         self.directory = dir
         loadAll()

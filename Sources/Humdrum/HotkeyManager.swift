@@ -71,10 +71,10 @@ final class HotkeyManager {
         self.eventHandler = handlerRef
 
         // Register the actual hotkey. Signature is an arbitrary FourCC
-        // ("MSCD" = Meeting Scribe Dictation) — macOS uses it for
-        // disambiguation if multiple processes register hotkeys.
+        // ("HDRM" = Humdrum) — macOS uses it for disambiguation if
+        // multiple processes register hotkeys.
         let hotKeyID = EventHotKeyID(
-            signature: OSType(0x4D53_4344), // "MSCD"
+            signature: OSType(0x4844_524D), // "HDRM"
             id: 1
         )
         var ref: EventHotKeyRef?

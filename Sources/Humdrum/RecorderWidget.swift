@@ -24,7 +24,13 @@ struct RecorderWindowStyler: NSViewRepresentable {
             window.isMovableByWindowBackground = false
             window.backgroundColor = .clear
             window.isOpaque = false
-            window.hasShadow = true
+            // IMPORTANT: window.hasShadow renders a 1px hairline rim at
+            // the pixel boundary of the opaque content, which reads as
+            // an unwanted outline around our rounded card. The SwiftUI
+            // `.shadow(...)` on the card already provides depth, so we
+            // explicitly disable the NSWindow-level shadow here to kill
+            // the rim.
+            window.hasShadow = false
             window.level = .floating
             window.collectionBehavior.insert(.canJoinAllSpaces)
         }
@@ -49,16 +55,10 @@ struct RecorderWidget: View {
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
-            // Rounded translucent card
+            // Rounded translucent card — no border stroke; the drop
+            // shadow alone separates it from whatever's behind it.
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .fill(AppTheme.panel)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .stroke(
-                            manager.isRecording ? AppTheme.accentBorder : AppTheme.border,
-                            lineWidth: 0.7
-                        )
-                )
                 .shadow(color: .black.opacity(0.55), radius: 26, x: 0, y: 12)
 
             VStack(spacing: 8) {

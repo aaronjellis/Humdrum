@@ -76,6 +76,44 @@ private struct TranscriptsSettingsTab: View {
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
+
+            Section {
+                Toggle(isOn: $appState.autoSaveOnRecordEnd) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Save to default folder automatically")
+                        Text("When a recording ends, write the transcript to your default folder using your default format — no Save dialog.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .toggleStyle(.switch)
+                .tint(AppTheme.accent)
+                // NOTE: intentionally NOT .disabled() when the default
+                // folder is unset. A disabled toggle that silently
+                // refuses to flip reads as broken; instead we allow the
+                // flip and surface the inline warning below so the
+                // user understands *why* nothing will save.
+
+                if appState.autoSaveOnRecordEnd && appState.defaultSaveFolderPath == nil {
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(AppTheme.danger)
+                            .font(.caption)
+                        Text("Pick a default save folder above first — auto-save has nowhere to write until you do.")
+                            .font(.footnote)
+                            .foregroundStyle(AppTheme.danger)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            } header: {
+                Text("Auto-save")
+            } footer: {
+                Text("Duplicate filenames get a numeric suffix (for example, My-transcript-2026-04-22-0935-1.md) so back-to-back recordings never overwrite each other.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .formStyle(.grouped)
         .padding(16)
@@ -243,7 +281,7 @@ private struct DictationSettingsTab: View {
                     Image(systemName: "wrench.and.screwdriver")
                         .foregroundStyle(.secondary)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Already toggled MeetingScribe on?")
+                        Text("Already toggled Humdrum on?")
                             .font(.footnote.weight(.medium))
                         Text("Rebuilt copies of the app sometimes read as a new application to macOS. Reset the existing row and re-grant.")
                             .font(.caption)
@@ -291,16 +329,23 @@ private struct AboutSettingsTab: View {
             }
 
             VStack(spacing: 2) {
-                Text("Meeting Scribe")
+                Text("Humdrum")
                     .font(.title2.bold())
                 Text("Local transcripts & dictation, on-device.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
 
-            Text("v0.1.0")
+            // Pull the version + build straight out of Info.plist at
+            // runtime so "am I actually on the latest build?" is a
+            // quick glance in Settings → About rather than a chain of
+            // Finder/Dock/LaunchServices cache voodoo. build-app.sh
+            // auto-increments CFBundleVersion on every run.
+            Text(Self.versionString)
                 .font(.footnote)
                 .foregroundStyle(.tertiary)
+                .monospacedDigit()
+                .textSelection(.enabled)
 
             Spacer()
 
@@ -316,6 +361,18 @@ private struct AboutSettingsTab: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(20)
     }
+
+    /// e.g. "v0.2.0 (build 47)". Built once at first access so we
+    /// don't pay the Info.plist lookup on every view update. If
+    /// the keys are ever missing (unsigned dev run from SwiftPM,
+    /// say), falls back to a hardcoded "v0.0.0 (dev)" so the UI
+    /// still renders rather than silently collapsing the Text.
+    private static let versionString: String = {
+        let info = Bundle.main.infoDictionary ?? [:]
+        let short = info["CFBundleShortVersionString"] as? String ?? "0.0.0"
+        let build = info["CFBundleVersion"] as? String ?? "dev"
+        return "v\(short) (build \(build))"
+    }()
 
     private func privacyLine(_ title: String, _ body: String) -> some View {
         HStack(alignment: .top, spacing: 10) {

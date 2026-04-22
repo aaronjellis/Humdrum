@@ -1,7 +1,8 @@
 import SwiftUI
+import AppKit
 
 @main
-struct MeetingScribeApp: App {
+struct HumdrumApp: App {
 
     // Shared objects — same instances visible to every window + menu bar.
     @StateObject private var manager:    TranscriptionManager
@@ -11,6 +12,17 @@ struct MeetingScribeApp: App {
     @StateObject private var modelCache: ModelCache
 
     init() {
+        // Offer to move to /Applications before anything else. If the
+        // user accepts, the original launch terminates mid-init and we
+        // relaunch from the copy in /Applications, so it's safe to do
+        // this before the heavy setup below.
+        MoveToApplications.offerIfNeeded()
+
+        // Migrate UserDefaults from the old "MeetingScribe.*" namespace
+        // to "Humdrum.*" so users who had the dev build keep their
+        // preferences. Cheap, idempotent, safe to call every launch.
+        UserDefaultsMigrator.migrateLegacyKeysIfNeeded()
+
         // Copy bundled Whisper models (if any) into WhisperKit's cache
         // BEFORE ModelCache scans, so "bundled" shows up as "cached"
         // immediately on first launch.
@@ -31,7 +43,7 @@ struct MeetingScribeApp: App {
     var body: some Scene {
 
         // MARK: Main window
-        WindowGroup("Meeting Scribe", id: WindowID.main) {
+        WindowGroup("Humdrum", id: WindowID.main) {
             ContentView()
                 .environmentObject(manager)
                 .environmentObject(store)
@@ -134,7 +146,7 @@ private struct MenuBarContent: View {
 
             Divider()
 
-            Button("Open Meeting Scribe") {
+            Button("Open Humdrum") {
                 openWindow(id: WindowID.main)
                 NSApp.activate(ignoringOtherApps: true)
             }

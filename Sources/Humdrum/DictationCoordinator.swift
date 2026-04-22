@@ -7,9 +7,14 @@ import Carbon.HIToolbox
 /// Orchestrates Whisper Flow-style dictation.
 ///
 ///   Press ⌥Space → orb appears centered on screen → speak → each
-///   committed Whisper chunk is copied to the clipboard and ⌘V'd into
-///   whatever field had focus → 2.5 s of silence (or another ⌥Space)
-///   stops dictation and hides the orb.
+///   committed Whisper chunk is inserted directly into whatever field
+///   had focus via the Accessibility API → 2.5 s of silence (or another
+///   ⌥Space) stops dictation and hides the orb.
+///
+/// Text goes in via `kAXSelectedTextAttribute` only — no clipboard
+/// writes, no synthesized ⌘V keystrokes. See `PasteHelper` for the
+/// rationale (short version: silent clipboard mutation is surprising,
+/// and keystroke fallback hides real permission problems).
 ///
 /// Uses the shared TranscriptionManager but temporarily overrides its
 /// session-completion callback + settings so dictations aren't saved as
@@ -21,6 +26,24 @@ final class DictationCoordinator: ObservableObject {
 
     @Published private(set) var isDictating: Bool = false
     @Published private(set) var accessibilityGranted: Bool = false
+
+    /// Timestamp of the most recent successful paste into the focused
+    /// field. The overlay watches this to flash a short ring-pulse
+    /// around the orb each time a chunk lands — the user gets a
+    /// positive signal that Whisper → paste is flowing, instead of
+    /// wondering if anything's happening.
+    @Published private(set) var lastChunkPastedAt: Date?
+
+    /// Timestamp of the most recent activity (speech OR paste). The
+    /// overlay reads this to render a shrinking silence-countdown
+    /// ring; when the elapsed time since this moment reaches
+    /// `silenceTimeoutSeconds`, dictation auto-closes.
+    @Published private(set) var lastSpeechTime: Date?
+
+    /// Timestamp of the current dictation session's start. Exposed so
+    /// the overlay can render the no-speech-yet countdown before the
+    /// user has said their first word.
+    @Published private(set) var sessionStartedAt: Date?
 
     /// Master switch controlled from Settings. When false, the global
     /// hotkey is unregistered entirely and dictation can't be triggered.
@@ -34,8 +57,8 @@ final class DictationCoordinator: ObservableObject {
 
     // MARK: - Persisted keys
 
-    private static let hotkeyEnabledKey = "MeetingScribe.dictation.hotkeyEnabled"
-    private static let silenceTimeoutKey = "MeetingScribe.dictation.silenceTimeout"
+    private static let hotkeyEnabledKey = "Humdrum.dictation.hotkeyEnabled"
+    private static let silenceTimeoutKey = "Humdrum.dictation.silenceTimeout"
 
     // MARK: - Config
 
@@ -69,8 +92,6 @@ final class DictationCoordinator: ObservableObject {
 
     private var commitsSink: AnyCancellable?
     private var silenceTask: Task<Void, Never>?
-    private var lastSpeechTime: Date?
-    private var startTime: Date?
     private var tccObserver: NSObjectProtocol?
     private var accessibilityPollTimer: Timer?
 
@@ -145,13 +166,62 @@ final class DictationCoordinator: ObservableObject {
         accessibilityGranted = PasteHelper.accessibilityEnabled()
     }
 
+    /// Per-session reminder flag so we don't re-nag a user who has
+    /// explicitly said "start anyway" on this launch. They'll see the
+    /// pill on the overlay, which is enough ongoing signal.
+    private static var _nudgeSuppressedThisLaunch: Bool = false
+
+    private static func permissionNudgeSuppressed() -> Bool {
+        _nudgeSuppressedThisLaunch
+    }
+
+    /// Blocking alert presented on first start when Accessibility isn't
+    /// granted. Returns true if the user chooses "Start Anyway" — the
+    /// orb will still appear and listen, but nothing will land in the
+    /// focused field until they grant permission. Returns false if
+    /// they canceled or opted to open Settings, which aborts start.
+    private func promptAccessibilityAlert() -> Bool {
+        let alert = NSAlert()
+        alert.messageText = "Humdrum can't paste into the focused field"
+        alert.informativeText = """
+            Dictation needs Accessibility permission to place text into the app you're typing in. \
+            Without it the orb will still listen and transcribe — but nothing will land in the focused field.
+
+            Open System Settings → Privacy & Security → Accessibility and enable Humdrum.
+            """
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Open Settings…")
+        alert.addButton(withTitle: "Start Anyway")
+        alert.addButton(withTitle: "Cancel")
+
+        let response = alert.runModal()
+        switch response {
+        case .alertFirstButtonReturn:
+            // Open Settings and cancel this start — the user can hit
+            // ⌥Space again once they've flipped the toggle; by then
+            // the TCC notification observer will have refreshed state.
+            if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+                NSWorkspace.shared.open(url)
+            }
+            return false
+        case .alertSecondButtonReturn:
+            // Start Anyway — honor their choice and stop re-nagging
+            // for the rest of this launch. The overlay pill remains
+            // visible so they still see the warning.
+            Self._nudgeSuppressedThisLaunch = true
+            return true
+        default:
+            return false
+        }
+    }
+
     /// Shells out to `tccutil reset Accessibility <bundleID>` to clear
     /// any stale TCC grant for this app, then immediately triggers the
     /// macOS Accessibility grant prompt so the user can re-authorize.
     /// Without the second step, the user lands in an empty Privacy
     /// Settings pane with no pending request.
     func resetAccessibilityPermission() {
-        let bundleID = Bundle.main.bundleIdentifier ?? "com.aaronellis.meetingscribe"
+        let bundleID = Bundle.main.bundleIdentifier ?? "com.aaronellis.humdrum"
         let task = Process()
         task.launchPath = "/usr/bin/tccutil"
         task.arguments = ["reset", "Accessibility", bundleID]
@@ -189,17 +259,35 @@ final class DictationCoordinator: ObservableObject {
             return
         }
 
-        // Re-check Accessibility; show prompt if needed.
+        // Re-check Accessibility; show prompt if needed. The system
+        // prompt only fires the first time — subsequent starts just
+        // read the current TCC decision.
         accessibilityGranted = PasteHelper.accessibilityEnabled(prompt: true)
+
+        // If the user still isn't granted (either they ignored the
+        // system prompt, or this app's TCC row is stale after a
+        // rebuild), give them a blocking, actionable alert instead of
+        // starting dictation that would silently fail to paste. This
+        // is the "bounces but no text" fix — the failure mode was
+        // invisible, so users had no idea what to do.
+        if !accessibilityGranted,
+           !Self.permissionNudgeSuppressed(),
+           !promptAccessibilityAlert() {
+            return
+        }
 
         pastedText = ""
         lastSpeechTime = nil
-        startTime = Date()
+        lastChunkPastedAt = nil
+        sessionStartedAt = Date()
 
         // Show the orb IMMEDIATELY so the user gets feedback, even if
-        // we need a few seconds to load the model first.
+        // we need a few seconds to load the model first. The overlay
+        // observes `self` so the missing-permission pill appears/
+        // disappears in real time if the user flips Accessibility on
+        // while the orb is already up.
         isDictating = true
-        overlay.show(DictationOverlayView(manager: manager))
+        overlay.show(DictationOverlayView(manager: manager, dictation: self))
 
         // Ensure the Whisper model is loaded before we start recording.
         // Without this, manager.start() silently no-ops when it was
@@ -232,6 +320,13 @@ final class DictationCoordinator: ObservableObject {
                 guard let self else { return }
                 Task { @MainActor in self.handleTextUpdate(newText) }
             }
+
+        // Reset the session anchor now that the model is actually
+        // ready — otherwise a slow first-time model download would
+        // burn the entire 8 s no-speech budget before the user could
+        // say anything, and dictation would auto-stop on the very
+        // first silence-monitor tick.
+        sessionStartedAt = Date()
 
         startSilenceMonitor()
         await manager.start()
@@ -280,9 +375,24 @@ final class DictationCoordinator: ObservableObject {
     private func handleTextUpdate(_ newText: String) {
         let delta = computeDelta(newText)
         guard !delta.isEmpty else { return }
-        PasteHelper.paste(delta)
+
+        let result = PasteHelper.paste(delta)
         pastedText = newText
         lastSpeechTime = Date()
+
+        // If we couldn't actually get the text into the focused field
+        // (user revoked Accessibility, or the app is filtering events),
+        // refresh the status so the overlay's warning pill can appear
+        // immediately and stop silently pretending everything's fine.
+        switch result {
+        case .failed:
+            refreshAccessibilityStatus()
+        case .inserted:
+            // Publish the paste timestamp so the overlay's ring-pulse
+            // animation fires — user gets a confirmation burst every
+            // time a chunk successfully lands in the focused field.
+            lastChunkPastedAt = Date()
+        }
     }
 
     /// Diff between what the manager has committed and what we've already
@@ -320,7 +430,7 @@ final class DictationCoordinator: ObservableObject {
         }
 
         // No speech yet — check the "did you ever speak" timeout.
-        guard let start = startTime else { return }
+        guard let start = sessionStartedAt else { return }
         if lastSpeechTime == nil,
            Date().timeIntervalSince(start) >= noSpeechTimeoutSeconds {
             Task { await self.stop(reason: .noSpeechTimeout) }

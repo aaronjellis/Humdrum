@@ -53,10 +53,15 @@ struct AudioVisualizer: View {
         let base = 0.46
         let drift = sin(t * 0.155) * 0.18 + cos(t * 0.093) * 0.12
         let hue   = min(0.82, max(0.20, base + drift))
+        // Cranked saturation + brightness vs. the original so the orb
+        // reads as a punchy glowing sphere on a transparent background.
+        // `hot` is the bright highlight tint — we keep it noticeably
+        // tinted (not near-white) so the halo looks like colored light,
+        // not a generic white glow.
         return Palette(
-            accent: Color(hue: hue, saturation: 0.78, brightness: 0.82),
-            hot:    Color(hue: hue, saturation: 0.30, brightness: 1.00),
-            deep:   Color(hue: hue, saturation: 0.78, brightness: 0.50)
+            accent: Color(hue: hue, saturation: 0.95, brightness: 0.96),
+            hot:    Color(hue: hue, saturation: 0.55, brightness: 1.00),
+            deep:   Color(hue: hue, saturation: 0.92, brightness: 0.62)
         )
     }
 
@@ -86,7 +91,7 @@ struct AudioVisualizer: View {
                 bobAmp:     .random(in: 2.5 ... 6.0),
                 bobSpeed:   .random(in: 0.4 ... 1.4),
                 baseSize:   .random(in: 22 ... 44),
-                opacity:    .random(in: 0.14 ... 0.24)
+                opacity:    .random(in: 0.24 ... 0.36)
             )
         })
     }
@@ -134,13 +139,14 @@ struct AudioVisualizer: View {
             .fill(
                 RadialGradient(
                     gradient: Gradient(stops: [
-                        .init(color: p.accent.opacity(0.45), location: 0),
-                        .init(color: p.accent.opacity(0.12), location: 0.55),
+                        .init(color: p.accent.opacity(0.70), location: 0),
+                        .init(color: p.accent.opacity(0.28), location: 0.50),
+                        .init(color: p.deep.opacity(0.08),   location: 0.82),
                         .init(color: .clear,                 location: 1.0)
                     ]),
                     center: .center,
-                    startRadius: size * 0.10,
-                    endRadius: size * 0.55
+                    startRadius: size * 0.08,
+                    endRadius: size * 0.58
                 )
             )
             .blur(radius: size * 0.11)
@@ -154,8 +160,8 @@ struct AudioVisualizer: View {
             .fill(
                 RadialGradient(
                     gradient: Gradient(stops: [
-                        .init(color: p.hot.opacity(0.22 + Double(level) * 0.35), location: 0),
-                        .init(color: p.accent.opacity(0.18), location: 0.45),
+                        .init(color: p.hot.opacity(0.45 + Double(level) * 0.40), location: 0),
+                        .init(color: p.accent.opacity(0.32), location: 0.45),
                         .init(color: .clear,                 location: 1.0)
                     ]),
                     center: .center,
@@ -174,10 +180,10 @@ struct AudioVisualizer: View {
             .fill(
                 RadialGradient(
                     gradient: Gradient(stops: [
-                        .init(color: core.opacity(0.30),     location: 0.00),
-                        .init(color: p.hot.opacity(0.28),    location: 0.32),
-                        .init(color: p.accent.opacity(0.22), location: 0.72),
-                        .init(color: p.deep.opacity(0.15),   location: 0.93),
+                        .init(color: core.opacity(0.50),     location: 0.00),
+                        .init(color: p.hot.opacity(0.55),    location: 0.32),
+                        .init(color: p.accent.opacity(0.45), location: 0.72),
+                        .init(color: p.deep.opacity(0.30),   location: 0.93),
                         .init(color: .clear,                 location: 1.00)
                     ]),
                     center: UnitPoint(x: 0.38, y: 0.30),
@@ -237,18 +243,18 @@ struct AudioVisualizer: View {
                     .stroke(
                         LinearGradient(
                             colors: [
-                                p.accent.opacity(0.08),
-                                p.hot.opacity(0.45),
-                                p.accent.opacity(0.15)
+                                p.accent.opacity(0.25),
+                                p.hot.opacity(0.85),
+                                p.accent.opacity(0.35)
                             ],
                             startPoint: .topLeading,
                             endPoint: .bottomTrailing
                         ),
-                        lineWidth: 0.9
+                        lineWidth: 1.1
                     )
                     .frame(width: r * 2, height: r * 2)
                     .blur(radius: 0.7)
-                    .opacity(0.30 + Double(level) * 0.35 + pulse * 0.12)
+                    .opacity(0.45 + Double(level) * 0.40 + pulse * 0.15)
             }
         }
     }
@@ -259,8 +265,8 @@ struct AudioVisualizer: View {
             .fill(
                 RadialGradient(
                     gradient: Gradient(stops: [
-                        .init(color: core.opacity(0.55), location: 0),
-                        .init(color: p.hot.opacity(0.22), location: 0.5),
+                        .init(color: core.opacity(0.85), location: 0),
+                        .init(color: p.hot.opacity(0.45), location: 0.5),
                         .init(color: .clear,              location: 1.0)
                     ]),
                     center: .center,
@@ -269,7 +275,7 @@ struct AudioVisualizer: View {
                 )
             )
             .blur(radius: size * 0.03)
-            .frame(width: size * 0.20, height: size * 0.20)
+            .frame(width: size * 0.22, height: size * 0.22)
             .offset(x: -size * 0.07, y: -size * 0.065)
             .scaleEffect(1.0 + level * 0.4 + CGFloat(sin(t * 1.4)) * 0.06)
     }
@@ -281,14 +287,14 @@ struct AudioVisualizer: View {
                 LinearGradient(
                     colors: [
                         .clear,
-                        p.hot.opacity(0.55 + Double(level) * 0.35),
-                        p.accent.opacity(0.35),
+                        p.hot.opacity(0.85 + Double(level) * 0.15),
+                        p.accent.opacity(0.65),
                         .clear
                     ],
                     startPoint: .topLeading,
                     endPoint: .bottomTrailing
                 ),
-                lineWidth: 0.85
+                lineWidth: 1.1
             )
             .frame(width: size * 0.65, height: size * 0.65)
             .blur(radius: 0.35)

@@ -199,13 +199,11 @@ struct SessionDetailView: View {
             panel.directoryURL = defaultFolder
         }
 
-        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd-HHmm"
-        let base = session.displayTitle
-            .replacingOccurrences(of: "/", with: "-")
-            .replacingOccurrences(of: ":", with: "-")
-        // Pre-select the user's default format via the extension.
-        let defaultExt = appState.defaultSaveFormat.fileExtension
-        panel.nameFieldStringValue = "\(base)-\(f.string(from: session.createdAt)).\(defaultExt)"
+        // Pre-select the user's default format via the filename extension.
+        panel.nameFieldStringValue = TranscriptExporter.defaultFilename(
+            for: session,
+            format: appState.defaultSaveFormat
+        )
 
         guard panel.runModal() == .OK, let url = panel.url else { return }
 
@@ -215,16 +213,7 @@ struct SessionDetailView: View {
         let format = SaveFormat(rawValue: ext == "markdown" ? "md" : ext) ?? .txt
 
         do {
-            switch format {
-            case .txt:
-                try session.transcriptText.write(to: url, atomically: true, encoding: .utf8)
-            case .md:
-                try markdownExport().write(to: url, atomically: true, encoding: .utf8)
-            case .rtf:
-                try rtfExport().write(to: url, options: [.atomic])
-            case .json:
-                try jsonExport().write(to: url, atomically: true, encoding: .utf8)
-            }
+            try TranscriptExporter.write(session: session, format: format, to: url)
         } catch {
             let alert = NSAlert()
             alert.messageText = "Couldn't save transcript"
@@ -232,145 +221,6 @@ struct SessionDetailView: View {
             alert.alertStyle = .warning
             alert.runModal()
         }
-    }
-
-    /// Rich text — title, metadata, bolded Speaker N: labels. Pastes
-    /// into Word/Pages/TextEdit with styling preserved.
-    private func rtfExport() -> Data {
-        let out = NSMutableAttributedString()
-
-        // Title
-        out.append(.init(
-            string: session.displayTitle + "\n",
-            attributes: [
-                .font: NSFont.boldSystemFont(ofSize: 20)
-            ]
-        ))
-
-        // Metadata line
-        let dateFormatter = DateFormatter()
-        dateFormatter.dateStyle = .full
-        dateFormatter.timeStyle = .short
-        let d = session.durationSeconds
-        let durationStr = String(format: "%d:%02d", d / 60, d % 60)
-        let metaLine = "\(dateFormatter.string(from: session.createdAt)) · \(durationStr) · "
-            + "Quality: \(session.settings.quality.capitalized), "
-            + "Noise filter: \(session.settings.noiseFilter.capitalized)\n\n"
-        out.append(.init(
-            string: metaLine,
-            attributes: [
-                .font: NSFont.systemFont(ofSize: 11),
-                .foregroundColor: NSColor.secondaryLabelColor
-            ]
-        ))
-
-        // Body paragraphs, bolding any leading "Speaker N:"
-        let bodyFont = NSFont.systemFont(ofSize: 13)
-        let boldFont = NSFont.boldSystemFont(ofSize: 13)
-        let paragraphs = session.transcriptText
-            .components(separatedBy: "\n\n")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-
-        let speakerRegex = try? NSRegularExpression(pattern: #"^(Speaker\s+\d+:)\s*"#)
-
-        for (idx, paragraph) in paragraphs.enumerated() {
-            if let regex = speakerRegex,
-               let match = regex.firstMatch(
-                   in: paragraph,
-                   range: NSRange(location: 0, length: paragraph.utf16.count)
-               ),
-               let labelRange = Range(match.range(at: 1), in: paragraph) {
-                let label = String(paragraph[labelRange])
-                let rest = paragraph[labelRange.upperBound...]
-                    .trimmingCharacters(in: .whitespaces)
-                out.append(.init(string: label + " ", attributes: [.font: boldFont]))
-                out.append(.init(string: rest, attributes: [.font: bodyFont]))
-            } else {
-                out.append(.init(string: paragraph, attributes: [.font: bodyFont]))
-            }
-            if idx < paragraphs.count - 1 {
-                out.append(.init(string: "\n\n", attributes: [.font: bodyFont]))
-            }
-        }
-
-        return out.rtf(
-            from: NSRange(location: 0, length: out.length),
-            documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]
-        ) ?? Data()
-    }
-
-    /// JSON — metadata + transcript for programmatic pipelines.
-    private func jsonExport() -> String {
-        struct Export: Codable {
-            let title: String
-            let createdAt: String
-            let durationSeconds: Int
-            let transcript: String
-            let settings: Settings
-            struct Settings: Codable {
-                let quality: String
-                let noiseFilter: String
-                let speakerLabelsEnabled: Bool
-                let vocabularyHints: String
-            }
-        }
-        let iso = ISO8601DateFormatter()
-        let export = Export(
-            title: session.displayTitle,
-            createdAt: iso.string(from: session.createdAt),
-            durationSeconds: session.durationSeconds,
-            transcript: session.transcriptText,
-            settings: Export.Settings(
-                quality: session.settings.quality,
-                noiseFilter: session.settings.noiseFilter,
-                speakerLabelsEnabled: session.settings.speakerLabelsEnabled,
-                vocabularyHints: session.settings.vocabularyHints
-            )
-        )
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        guard let data = try? encoder.encode(export),
-              let str = String(data: data, encoding: .utf8) else {
-            return "{}"
-        }
-        return str
-    }
-
-    /// Produces a Markdown version of the transcript with a title, a
-    /// metadata line, and bold Speaker X labels. Plain text passages
-    /// (no speaker prefix) are kept as paragraphs.
-    private func markdownExport() -> String {
-        var md = "# \(session.displayTitle)\n\n"
-
-        let f = DateFormatter()
-        f.dateStyle = .full
-        f.timeStyle = .short
-        let date = f.string(from: session.createdAt)
-        let d = session.durationSeconds
-        let duration = String(format: "%d:%02d", d / 60, d % 60)
-
-        md += "_\(date) · \(duration) · "
-        md += "Quality: \(session.settings.quality.capitalized), "
-        md += "Noise filter: \(session.settings.noiseFilter.capitalized)_\n\n"
-        md += "---\n\n"
-
-        // Bold any leading "Speaker N:" on each paragraph.
-        let paragraphs = session.transcriptText
-            .components(separatedBy: "\n\n")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-
-        for p in paragraphs {
-            let withBoldLabel = p.replacingOccurrences(
-                of: #"^(Speaker\s+\d+):"#,
-                with: "**$1:**",
-                options: .regularExpression
-            )
-            md += "\(withBoldLabel)\n\n"
-        }
-
-        return md
     }
 
     private func delete() {
