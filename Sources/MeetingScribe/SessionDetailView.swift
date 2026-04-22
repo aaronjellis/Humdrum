@@ -1,0 +1,380 @@
+import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
+
+/// Read-only view of a previously-recorded session.
+///
+/// Lives in the main window and is what the user sees immediately after
+/// stopping a recording. The transcript is already there (no speaker
+/// labels); a spinner in the header indicates when background diarization
+/// is still running, and the transcript text re-renders in place once it
+/// finishes.
+struct SessionDetailView: View {
+    @EnvironmentObject var store: SessionStore
+    @EnvironmentObject var appState: AppState
+    let session: TranscriptSession
+
+    @State private var showCopyConfirmation: Bool = false
+
+    /// True if the background diarization worker is still processing this
+    /// specific session. Independent of the manager — the user can be
+    /// recording a new session while we show the spinner on an older one.
+    private var isDiarizingThisSession: Bool {
+        appState.isDiarizing(sessionId: session.id)
+    }
+
+    var body: some View {
+        ZStack {
+            AppTheme.background.ignoresSafeArea()
+
+            VStack(alignment: .leading, spacing: 0) {
+                header
+                Divider().overlay(AppTheme.border)
+                metaRow
+                Divider().overlay(AppTheme.border)
+                transcriptScroll
+                Divider().overlay(AppTheme.border)
+                footerBar
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var header: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Text(session.displayTitle)
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(AppTheme.textPrimary)
+                .lineLimit(2)
+
+            if isDiarizingThisSession {
+                diarizingBadge
+            }
+
+            Spacer()
+            Text(TranscriptSession.formattedDate(session.createdAt))
+                .font(.system(size: 11))
+                .foregroundStyle(AppTheme.textTertiary)
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 14)
+    }
+
+    private var diarizingBadge: some View {
+        HStack(spacing: 6) {
+            ProgressView()
+                .controlSize(.small)
+                .tint(AppTheme.accent)
+            Text("Analyzing voices…")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(AppTheme.textSecondary)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 4)
+        .background(Capsule().fill(AppTheme.accentSoft))
+        .overlay(Capsule().stroke(AppTheme.accentBorder, lineWidth: 0.5))
+    }
+
+    private var metaRow: some View {
+        HStack(spacing: 8) {
+            chip(label: "Quality · \(session.settings.quality.capitalized)")
+            chip(label: "Noise · \(session.settings.noiseFilter.capitalized)")
+            if session.settings.speakerLabelsEnabled {
+                chip(label: "Speakers labeled")
+            }
+            chip(label: durationText)
+            Spacer()
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 10)
+    }
+
+    private func chip(label: String) -> some View {
+        Text(label)
+            .font(.system(size: 10, weight: .medium))
+            .foregroundStyle(AppTheme.textSecondary)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(
+                Capsule().fill(AppTheme.panel)
+            )
+            .overlay(
+                Capsule().stroke(AppTheme.border, lineWidth: 0.5)
+            )
+    }
+
+    private var durationText: String {
+        let d = session.durationSeconds
+        return "Duration · " + String(format: "%d:%02d", d / 60, d % 60)
+    }
+
+    private var transcriptScroll: some View {
+        ScrollView {
+            Text(session.transcriptText.isEmpty ? "(empty transcript)" : session.transcriptText)
+                .font(.system(size: 14))
+                .foregroundStyle(AppTheme.textPrimary)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(20)
+        }
+        .frame(maxHeight: .infinity)
+    }
+
+    private var footerBar: some View {
+        HStack(spacing: 10) {
+            action(title: showCopyConfirmation ? "Copied!" : "Copy",
+                   systemImage: showCopyConfirmation ? "checkmark" : "doc.on.doc",
+                   run: copyTranscript)
+                .keyboardShortcut("c", modifiers: [.command, .shift])
+
+            action(title: "Save…", systemImage: "square.and.arrow.down", run: save)
+                .keyboardShortcut("s", modifiers: [.command])
+                .help("Save as .txt or .md")
+
+            Spacer()
+
+            action(title: "Delete", systemImage: "trash", destructive: true, run: delete)
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 14)
+    }
+
+    private func action(
+        title: String,
+        systemImage: String,
+        destructive: Bool = false,
+        run: @escaping () -> Void
+    ) -> some View {
+        Button(action: run) {
+            HStack(spacing: 6) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 11, weight: .medium))
+                Text(title)
+                    .font(.system(size: 12, weight: .medium))
+            }
+            .foregroundStyle(destructive ? AppTheme.recording : AppTheme.textPrimary)
+            .padding(.horizontal, 11)
+            .padding(.vertical, 7)
+            .background(
+                RoundedRectangle(cornerRadius: 7)
+                    .fill(destructive ? AppTheme.recording.opacity(0.15) : AppTheme.panelElevated)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 7)
+                    .stroke(destructive ? AppTheme.recording.opacity(0.35) : AppTheme.border, lineWidth: 0.5)
+            )
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: Actions
+
+    private func copyTranscript() {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(session.transcriptText, forType: .string)
+        showCopyConfirmation = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { showCopyConfirmation = false }
+    }
+
+    private func save() {
+        // All four formats are offered in the panel's File Format
+        // dropdown. Default format is the one the user picked in
+        // Settings; pre-populated filename carries its extension.
+        let markdownType = UTType("net.daringfireball.markdown")
+            ?? UTType(filenameExtension: "md", conformingTo: .plainText)
+            ?? .plainText
+        let rtfType = UTType.rtf
+        let jsonType = UTType.json
+
+        let panel = NSSavePanel()
+        panel.title = "Save Transcript"
+        panel.message = "Choose a folder and format."
+        panel.allowedContentTypes = [.plainText, markdownType, rtfType, jsonType]
+        panel.canCreateDirectories = true
+        panel.showsTagField = false
+
+        if let defaultFolder = appState.defaultSaveFolderURL {
+            panel.directoryURL = defaultFolder
+        }
+
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd-HHmm"
+        let base = session.displayTitle
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+        // Pre-select the user's default format via the extension.
+        let defaultExt = appState.defaultSaveFormat.fileExtension
+        panel.nameFieldStringValue = "\(base)-\(f.string(from: session.createdAt)).\(defaultExt)"
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        // Resolve the chosen format from whatever extension the panel
+        // ended up with. Default to plain text on anything unrecognized.
+        let ext = url.pathExtension.lowercased()
+        let format = SaveFormat(rawValue: ext == "markdown" ? "md" : ext) ?? .txt
+
+        do {
+            switch format {
+            case .txt:
+                try session.transcriptText.write(to: url, atomically: true, encoding: .utf8)
+            case .md:
+                try markdownExport().write(to: url, atomically: true, encoding: .utf8)
+            case .rtf:
+                try rtfExport().write(to: url, options: [.atomic])
+            case .json:
+                try jsonExport().write(to: url, atomically: true, encoding: .utf8)
+            }
+        } catch {
+            let alert = NSAlert()
+            alert.messageText = "Couldn't save transcript"
+            alert.informativeText = error.localizedDescription
+            alert.alertStyle = .warning
+            alert.runModal()
+        }
+    }
+
+    /// Rich text — title, metadata, bolded Speaker N: labels. Pastes
+    /// into Word/Pages/TextEdit with styling preserved.
+    private func rtfExport() -> Data {
+        let out = NSMutableAttributedString()
+
+        // Title
+        out.append(.init(
+            string: session.displayTitle + "\n",
+            attributes: [
+                .font: NSFont.boldSystemFont(ofSize: 20)
+            ]
+        ))
+
+        // Metadata line
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateStyle = .full
+        dateFormatter.timeStyle = .short
+        let d = session.durationSeconds
+        let durationStr = String(format: "%d:%02d", d / 60, d % 60)
+        let metaLine = "\(dateFormatter.string(from: session.createdAt)) · \(durationStr) · "
+            + "Quality: \(session.settings.quality.capitalized), "
+            + "Noise filter: \(session.settings.noiseFilter.capitalized)\n\n"
+        out.append(.init(
+            string: metaLine,
+            attributes: [
+                .font: NSFont.systemFont(ofSize: 11),
+                .foregroundColor: NSColor.secondaryLabelColor
+            ]
+        ))
+
+        // Body paragraphs, bolding any leading "Speaker N:"
+        let bodyFont = NSFont.systemFont(ofSize: 13)
+        let boldFont = NSFont.boldSystemFont(ofSize: 13)
+        let paragraphs = session.transcriptText
+            .components(separatedBy: "\n\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+
+        let speakerRegex = try? NSRegularExpression(pattern: #"^(Speaker\s+\d+:)\s*"#)
+
+        for (idx, paragraph) in paragraphs.enumerated() {
+            if let regex = speakerRegex,
+               let match = regex.firstMatch(
+                   in: paragraph,
+                   range: NSRange(location: 0, length: paragraph.utf16.count)
+               ),
+               let labelRange = Range(match.range(at: 1), in: paragraph) {
+                let label = String(paragraph[labelRange])
+                let rest = paragraph[labelRange.upperBound...]
+                    .trimmingCharacters(in: .whitespaces)
+                out.append(.init(string: label + " ", attributes: [.font: boldFont]))
+                out.append(.init(string: rest, attributes: [.font: bodyFont]))
+            } else {
+                out.append(.init(string: paragraph, attributes: [.font: bodyFont]))
+            }
+            if idx < paragraphs.count - 1 {
+                out.append(.init(string: "\n\n", attributes: [.font: bodyFont]))
+            }
+        }
+
+        return out.rtf(
+            from: NSRange(location: 0, length: out.length),
+            documentAttributes: [.documentType: NSAttributedString.DocumentType.rtf]
+        ) ?? Data()
+    }
+
+    /// JSON — metadata + transcript for programmatic pipelines.
+    private func jsonExport() -> String {
+        struct Export: Codable {
+            let title: String
+            let createdAt: String
+            let durationSeconds: Int
+            let transcript: String
+            let settings: Settings
+            struct Settings: Codable {
+                let quality: String
+                let noiseFilter: String
+                let speakerLabelsEnabled: Bool
+                let vocabularyHints: String
+            }
+        }
+        let iso = ISO8601DateFormatter()
+        let export = Export(
+            title: session.displayTitle,
+            createdAt: iso.string(from: session.createdAt),
+            durationSeconds: session.durationSeconds,
+            transcript: session.transcriptText,
+            settings: Export.Settings(
+                quality: session.settings.quality,
+                noiseFilter: session.settings.noiseFilter,
+                speakerLabelsEnabled: session.settings.speakerLabelsEnabled,
+                vocabularyHints: session.settings.vocabularyHints
+            )
+        )
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(export),
+              let str = String(data: data, encoding: .utf8) else {
+            return "{}"
+        }
+        return str
+    }
+
+    /// Produces a Markdown version of the transcript with a title, a
+    /// metadata line, and bold Speaker X labels. Plain text passages
+    /// (no speaker prefix) are kept as paragraphs.
+    private func markdownExport() -> String {
+        var md = "# \(session.displayTitle)\n\n"
+
+        let f = DateFormatter()
+        f.dateStyle = .full
+        f.timeStyle = .short
+        let date = f.string(from: session.createdAt)
+        let d = session.durationSeconds
+        let duration = String(format: "%d:%02d", d / 60, d % 60)
+
+        md += "_\(date) · \(duration) · "
+        md += "Quality: \(session.settings.quality.capitalized), "
+        md += "Noise filter: \(session.settings.noiseFilter.capitalized)_\n\n"
+        md += "---\n\n"
+
+        // Bold any leading "Speaker N:" on each paragraph.
+        let paragraphs = session.transcriptText
+            .components(separatedBy: "\n\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+
+        for p in paragraphs {
+            let withBoldLabel = p.replacingOccurrences(
+                of: #"^(Speaker\s+\d+):"#,
+                with: "**$1:**",
+                options: .regularExpression
+            )
+            md += "\(withBoldLabel)\n\n"
+        }
+
+        return md
+    }
+
+    private func delete() {
+        store.delete(session)
+        appState.selection = .newSession
+    }
+}
