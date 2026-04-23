@@ -34,5 +34,29 @@
     <false/>
     <key>NSSupportsSuddenTermination</key>
     <false/>
+
+    <!--
+      Sparkle 2 auto-updater.
+
+      • SUFeedURL: appcast.xml URL. GitHub Pages is case-sensitive on the
+        repo-name portion, so this has to match aaronjellis/Humdrum
+        (capital H) exactly.
+      • SUPublicEDKey: the ed25519 public key that matches the private
+        key used to sign each release archive (see Docs/SPARKLE_SETUP.md).
+      • SUEnableAutomaticChecks: lets the scheduled timer run. Users
+        can still flip this off in Sparkle's built-in "Check for
+        updates automatically" preference toggle.
+      • SUScheduledCheckInterval: 86400 = once a day. Sparkle also
+        does one quick background check shortly after launch (see
+        SparkleUpdater.swift).
+    -->
+    <key>SUFeedURL</key>
+    <string>https://aaronjellis.github.io/Humdrum/appcast.xml</string>
+    <key>SUPublicEDKey</key>
+    <string>/68uEYrFfWbco1Htg/1fKc9zVIWpWowXnoY9fM4dQ/I=</string>
+    <key>SUEnableAutomaticChecks</key>
+    <true/>
+    <key>SUScheduledCheckInterval</key>
+    <integer>86400</integer>
 </dict>
 </plist>
