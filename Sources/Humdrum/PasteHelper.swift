@@ -9,31 +9,33 @@ import HumdrumCore
 /// The job of this file is narrow: read the live environment (Accessibility
 /// trust, frontmost bundle ID, focused AX role), hand those facts to
 /// `PasteCascade.decide`, then run the resulting `PasteDecision` through
-/// the two concrete strategies (keystroke synthesis → clipboard + ⌘V).
+/// the two concrete strategies (clipboard + ⌘V → keystroke synthesis).
 /// Every decision-level concern lives in HumdrumCore so it can be
 /// unit-tested without AppKit. This file is the thin I/O layer.
 ///
-/// Why two stages (and why not AX):
-///   Research into leading macOS dictation apps (Superwhisper, Wispr
-///   Flow, TypeVox, Talon, Aqua Voice) and documented failure reports
-///   against the AX text-insertion path in Chromium/Electron/Office/
-///   JetBrains converge on the same conclusion: `kAXSelectedTextAttribute`
-///   writes report `.success` but silently drop on too many target apps
-///   to be useful as a primary strategy. Going keystroke-first
-///   universally is simpler, more reliable, and avoids an entire class
-///   of verification gymnastics.
+/// Why clipboard-first, and why not AX:
+///   Both Superwhisper and Wispr Flow ship with clipboard + ⌘V as their
+///   default insertion path; keystroke simulation is an opt-in advanced
+///   setting in both. The reason is that ⌘V is the single OS-blessed
+///   insertion event that every mainstream target — Chrome, Electron
+///   (Slack, Discord, Teams, Claude desktop), Office, JetBrains, Safari,
+///   Notes, Terminal — accepts, whereas synthetic unicode key events
+///   can be silently filtered by Electron renderers and by some
+///   hardened web views. We validated that the hard way: keystroke-first
+///   looked clean in tests but silently no-op'd in Claude desktop. AX
+///   `kAXSelectedTextAttribute` writes are worse still — documented to
+///   report `.success` while silently dropping on too many target apps
+///   (Chromium, Electron, Office, JetBrains) to keep at any stage of
+///   the cascade.
 ///
-///   1. **Keystroke synthesis.** `CGEventKeyboardSetUnicodeString` posts
-///      unicode characters into the system-wide event tap. This is what
-///      the OS itself uses for text substitution, so it gets routed the
-///      same way the user's own typing does — including through any
-///      custom event handling Electron apps install. Does NOT touch the
-///      clipboard. Primary strategy for every non-refused paste.
-///   2. **Clipboard + ⌘V.** Tail fallback, reached only when the CGEvent
-///      source can't be constructed (very rare). Writes to
-///      `NSPasteboard.general`, synthesizes ⌘V, then restores the
-///      previous clipboard contents on a short delay so the user's
-///      copied text isn't obliterated.
+///   1. **Clipboard + ⌘V.** Writes to `NSPasteboard.general`,
+///      synthesizes ⌘V, then restores the previous clipboard contents
+///      after a short delay so the user's copied text isn't obliterated.
+///      Primary strategy for every non-refused paste.
+///   2. **Keystroke synthesis.** Tail fallback, reached only when the
+///      CGEvent source for ⌘V can't be constructed (very rare). Posts
+///      unicode characters via `CGEventKeyboardSetUnicodeString` into
+///      the system-wide event tap. Does NOT touch the clipboard.
 ///
 /// Above both stages, `decide()` also refuses outright when the focused
 /// element is a password field — we never type into secure text fields.
@@ -149,16 +151,18 @@ enum PasteHelper {
 // MARK: - Real backend
 
 /// Concrete `PasteBackend` used in production. Implements the two cascade
-/// stages: keystroke synthesis (primary) and clipboard + ⌘V (fallback).
+/// stages: clipboard + ⌘V (primary) and keystroke synthesis (fallback).
 /// Failures at either stage return `false` so `PasteCascade.execute` can
 /// fall through.
 private struct RealPasteBackend: PasteBackend {
 
-    // MARK: Stage 1 — Keystroke synthesis
+    // MARK: Stage 2 — Keystroke synthesis (fallback)
 
     /// Post unicode key-down events carrying `text` to the system-wide
-    /// event tap. This is the same path native text substitution takes,
-    /// so Electron apps that swallow AX writes still accept it.
+    /// event tap. Reached only when clipboard + ⌘V can't construct a
+    /// CGEvent source (rare) — retained as the tail fallback because a
+    /// few niche apps rebind ⌘V (vim in a terminal) or filter synthetic
+    /// paste events while still accepting typed unicode.
     ///
     /// Implementation notes:
     ///   • Chunked to 16 UTF-16 code units per event.
@@ -221,18 +225,21 @@ private struct RealPasteBackend: PasteBackend {
         return true
     }
 
-    // MARK: Stage 2 — Clipboard + ⌘V with restore
+    // MARK: Stage 1 — Clipboard + ⌘V with restore (primary)
 
     /// Write `text` to the general pasteboard, synthesize ⌘V, and restore
     /// the previous pasteboard contents after a short delay so the user's
-    /// copy buffer survives the paste. Only reached when both earlier
-    /// stages fall through — rare in practice but essential for apps that
-    /// ignore AX *and* filter synthetic unicode key events (some hardened
-    /// security tools, a few kiosk-style web frontends).
+    /// copy buffer survives the paste. Primary strategy for every
+    /// non-refused paste — matches what Superwhisper and Wispr Flow do
+    /// by default. ⌘V is the single OS-blessed insert event that every
+    /// mainstream target (Chrome, Electron, Office, JetBrains, Safari,
+    /// Terminal) accepts; synthetic unicode key events can be silently
+    /// filtered by Electron renderers.
     ///
     /// The restore delay needs to be long enough that the receiving app
     /// has finished reading the pasteboard in response to ⌘V. 350ms is
-    /// comfortably past the worst case we've observed.
+    /// comfortably past the worst case we've observed. Wispr Flow uses
+    /// ~500ms for the same reason.
     func insertViaClipboard(_ text: String) -> Bool {
         guard let source = CGEventSource(stateID: .combinedSessionState) else {
             return false

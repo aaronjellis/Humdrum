@@ -385,21 +385,25 @@ final class DictationCoordinator: ObservableObject {
         guard !delta.isEmpty else { return }
 
         let result = PasteHelper.paste(delta)
-        pastedText = newText
         lastSpeechTime = Date()
 
-        // If we couldn't actually get the text into the focused field
-        // (user revoked Accessibility, or the app is filtering events),
-        // refresh the status so the overlay's warning pill can appear
-        // immediately and stop silently pretending everything's fine.
+        // Only advance `pastedText` when the cascade actually inserted
+        // the chunk. If we advanced on `.failed` we'd silently drop the
+        // delta forever — the next tick's computeDelta would no longer
+        // include it. Leaving `pastedText` in place means the missed
+        // chunk gets retried on the next Whisper update.
         switch result {
-        case .failed:
-            refreshAccessibilityStatus()
         case .inserted:
+            pastedText = newText
             // Publish the paste timestamp so the overlay's ring-pulse
             // animation fires — user gets a confirmation burst every
             // time a chunk successfully lands in the focused field.
             lastChunkPastedAt = Date()
+        case .failed:
+            // Refresh status so the overlay's warning pill can appear
+            // (e.g. user revoked Accessibility mid-session) instead of
+            // silently pretending everything's fine.
+            refreshAccessibilityStatus()
         }
     }
 

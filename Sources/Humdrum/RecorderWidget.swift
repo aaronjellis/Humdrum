@@ -16,12 +16,17 @@ struct RecorderWindowStyler: NSViewRepresentable {
             // of window gutter at top and bottom. Replacing the style
             // mask outright removes all of that. We don't need standard
             // controls (traffic lights, titlebar drag, resize) because
-            // we supply our own close X + stop button and the window
-            // isn't resizable or draggable by titlebar.
+            // we supply our own close X + stop button.
             window.styleMask = [.borderless, .fullSizeContentView]
             window.titleVisibility = .hidden
             window.titlebarAppearsTransparent = true
-            window.isMovableByWindowBackground = false
+            // Drag by body. A borderless floating widget has no title
+            // bar for the user to grab, so without these flags the
+            // window is pinned in place. Buttons inside the view (stop,
+            // close) intercept their own clicks first, so drag only
+            // kicks in on empty areas of the card.
+            window.isMovable = true
+            window.isMovableByWindowBackground = true
             window.backgroundColor = .clear
             window.isOpaque = false
             // IMPORTANT: window.hasShadow renders a 1px hairline rim at
