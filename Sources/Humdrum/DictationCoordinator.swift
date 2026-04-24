@@ -3,6 +3,7 @@ import SwiftUI
 import Combine
 import AppKit
 import Carbon.HIToolbox
+import HumdrumCore
 
 /// Orchestrates Whisper Flow-style dictation.
 ///
@@ -117,7 +118,14 @@ final class DictationCoordinator: ObservableObject {
                 object: nil,
                 queue: .main
             ) { [weak self] _ in
-                self?.refreshAccessibilityStatus()
+                // The notification queue is `.main`, but the closure is
+                // still nonisolated — hop to @MainActor explicitly so
+                // `refreshAccessibilityStatus()` (which is main-actor-
+                // bound) can be called without tripping the strict
+                // concurrency diagnostic.
+                Task { @MainActor [weak self] in
+                    self?.refreshAccessibilityStatus()
+                }
             }
 
         // Notification fires only on TCC database changes, which doesn't

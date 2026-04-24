@@ -243,19 +243,7 @@ struct DictationOverlayView: View {
     @ViewBuilder
     private func silenceCountdown(now: Date) -> some View {
         let grace: TimeInterval = 0.4
-        let anchor: Date?
-        let total: TimeInterval
-
-        if let last = dictation.lastSpeechTime {
-            anchor = last
-            total = dictation.silenceTimeoutSeconds
-        } else if let start = dictation.sessionStartedAt {
-            anchor = start
-            total = dictation.noSpeechTimeoutSeconds
-        } else {
-            anchor = nil
-            total = 0
-        }
+        let (anchor, total) = countdownAnchor()
 
         if let anchor, total > grace {
             let elapsed = now.timeIntervalSince(anchor)
@@ -276,6 +264,21 @@ struct DictationOverlayView: View {
                     .opacity(0.85)
             }
         }
+    }
+
+    /// Non-@ViewBuilder helper that resolves `(anchor, total)` for the
+    /// countdown ring. Lives outside the builder body because SwiftUI's
+    /// result-builder machinery can't see past imperative assignment
+    /// statements — every line inside `@ViewBuilder` must be a view
+    /// expression.
+    private func countdownAnchor() -> (Date?, TimeInterval) {
+        if let last = dictation.lastSpeechTime {
+            return (last, dictation.silenceTimeoutSeconds)
+        }
+        if let start = dictation.sessionStartedAt {
+            return (start, dictation.noSpeechTimeoutSeconds)
+        }
+        return (nil, 0)
     }
 
     /// Shown only when Accessibility isn't granted. Explains in one

@@ -166,6 +166,45 @@ cp "${BIN_PATH}/${APP_NAME}" "${APP_DIR}/Contents/MacOS/${APP_NAME}"
 cp "Info.plist"              "${APP_DIR}/Contents/Info.plist"
 
 # --------------------------------------------------------------------------
+# Stage third-party frameworks (Sparkle, etc.) into Contents/Frameworks/
+#
+# `swift build` resolves XCFramework dependencies at link time but does NOT
+# copy them into the .app for you — that's a step Xcode normally handles
+# via a "Copy Files" build phase, and SwiftPM's CLI build has no equivalent.
+# Without this, the app launches to a dyld crash:
+#   Library not loaded: @rpath/Sparkle.framework/Versions/B/Sparkle
+#
+# SPM stages resolved frameworks under either `PackageFrameworks/` (modern
+# toolchain layout) or directly at the bin path root (older layout); we
+# accept both. rsync preserves the Versions/Current → A symlink scheme
+# that macOS frameworks depend on — a plain `cp -R` would flatten them.
+# --------------------------------------------------------------------------
+echo "==> Staging third-party frameworks into Contents/Frameworks/…"
+mkdir -p "${APP_DIR}/Contents/Frameworks"
+shopt -s nullglob
+staged_any=0
+for fw in "${BIN_PATH}/PackageFrameworks"/*.framework "${BIN_PATH}"/*.framework; do
+  [ -d "$fw" ] || continue
+  rsync -a "$fw" "${APP_DIR}/Contents/Frameworks/"
+  echo "    • $(basename "$fw")"
+  staged_any=1
+done
+shopt -u nullglob
+if [ "${staged_any}" -eq 0 ]; then
+  echo "    (no frameworks found at ${BIN_PATH} — check that \`swift build\` resolved Sparkle)"
+fi
+
+# Add the Frameworks dir to the main binary's runtime search path. SPM's
+# default linker flags only set @executable_path as an rpath, which would
+# make dyld look in Contents/MacOS/ (wrong). Adding @executable_path/..
+# /Frameworks matches Apple's bundle convention. `|| true` because rerunning
+# the script after `swift build` reproduces the binary fresh, so the rpath
+# add is always needed; but if for some reason it was already there,
+# install_name_tool exits non-zero on duplicate and we don't care.
+install_name_tool -add_rpath "@executable_path/../Frameworks" \
+  "${APP_DIR}/Contents/MacOS/${APP_NAME}" 2>/dev/null || true
+
+# --------------------------------------------------------------------------
 # Auto-bump CFBundleVersion on every build, monotonically.
 #
 # The short version (CFBundleShortVersionString, e.g. "0.2.0") is the
@@ -294,6 +333,24 @@ while IFS= read -r -d '' item; do
   esac
 done < <(find "${APP_DIR}/Contents/Resources" \
            \( -name '*.dylib' -o -name '*.framework' -o -name '*.bundle' \) \
+           -print0)
+
+# Sign everything inside Contents/Frameworks/ — Sparkle specifically ships
+# four nested code-bearing artifacts (Autoupdate, Updater.app, Downloader
+# .xpc, Installer.xpc) that MUST each carry a valid signature before the
+# outer framework signature is applied, and the outer framework signature
+# must land before we sign the app bundle. Walk deepest-first (-depth) so
+# children are signed before their parents.
+while IFS= read -r -d '' item; do
+  case "$item" in
+    *.dylib|*.framework|*.xpc|*.app)
+      codesign --force --timestamp --options runtime \
+        --sign "${SIGN_IDENTITY}" \
+        "${item}"
+      ;;
+  esac
+done < <(find "${APP_DIR}/Contents/Frameworks" -depth \
+           \( -name '*.dylib' -o -name '*.framework' -o -name '*.xpc' -o -name '*.app' \) \
            -print0)
 
 # Sign the main executable explicitly with entitlements so the

@@ -10,7 +10,10 @@ struct HumdrumApp: App {
     @StateObject private var appState:   AppState
     @StateObject private var dictation:  DictationCoordinator
     @StateObject private var modelCache: ModelCache
+    @StateObject private var onboarding: OnboardingState
+    @StateObject private var updater:    SparkleUpdater
 
+    @MainActor
     init() {
         // Offer to move to /Applications before anything else. If the
         // user accepts, the original launch terminates mid-init and we
@@ -33,36 +36,66 @@ struct HumdrumApp: App {
         let a  = AppState()
         let d  = DictationCoordinator(manager: m)
         let mc = ModelCache()
+        let ob = OnboardingState()
+        let up = SparkleUpdater()
         _manager    = StateObject(wrappedValue: m)
         _store      = StateObject(wrappedValue: s)
         _appState   = StateObject(wrappedValue: a)
         _dictation  = StateObject(wrappedValue: d)
         _modelCache = StateObject(wrappedValue: mc)
+        _onboarding = StateObject(wrappedValue: ob)
+        _updater    = StateObject(wrappedValue: up)
     }
 
     var body: some Scene {
 
-        // MARK: Main window
+        // MARK: Main window — gated behind onboarding.
+        //
+        // First-run: show OnboardingWindow until the user finishes the
+        // flow (persists "Humdrum.onboarded.v1" in UserDefaults). After
+        // that, cold launches skip straight to ContentView. We reuse
+        // the same WindowGroup so the window identity/size persists
+        // across the swap instead of a second window opening.
         WindowGroup("Humdrum", id: WindowID.main) {
-            ContentView()
-                .environmentObject(manager)
-                .environmentObject(store)
-                .environmentObject(appState)
-                .environmentObject(dictation)
-                .environmentObject(modelCache)
-                .frame(minWidth: 900, minHeight: 620)
-                .task {
-                    appState.wire(manager: manager, store: store)
-                    dictation.installHotkey()
-                    // Refresh the cache-status UI whenever a new Whisper
-                    // model finishes loading.
-                    manager.onModelLoaded = { [weak modelCache] in
-                        modelCache?.refresh()
-                    }
+            Group {
+                if onboarding.isOnboarded {
+                    ContentView()
+                } else {
+                    OnboardingWindow()
                 }
+            }
+            .environmentObject(manager)
+            .environmentObject(store)
+            .environmentObject(appState)
+            .environmentObject(dictation)
+            .environmentObject(modelCache)
+            .environmentObject(onboarding)
+            .environmentObject(updater)
+            .frame(minWidth: 900, minHeight: 620)
+            .task {
+                appState.wire(manager: manager, store: store)
+                dictation.installHotkey()
+                // Refresh the cache-status UI whenever a new Whisper
+                // model finishes loading.
+                manager.onModelLoaded = { [weak modelCache] in
+                    modelCache?.refresh()
+                }
+            }
         }
         .windowResizability(.contentMinSize)
-        .commands { CommandGroup(replacing: .newItem) {} }
+        .commands {
+            CommandGroup(replacing: .newItem) {}
+            // Standard macOS home for "Check for Updates…": just
+            // below "About Humdrum" in the application menu. Dims
+            // while a check is already in flight so users can't pile
+            // up concurrent network requests.
+            CommandGroup(after: .appInfo) {
+                Button("Check for Updates…") {
+                    updater.checkForUpdates()
+                }
+                .disabled(!updater.canCheck)
+            }
+        }
 
         // MARK: Pre-recording setup
         Window("New Recording", id: WindowID.setup) {
@@ -91,6 +124,7 @@ struct HumdrumApp: App {
             MenuBarContent()
                 .environmentObject(manager)
                 .environmentObject(dictation)
+                .environmentObject(updater)
         } label: {
             Image(systemName: menuBarIcon)
                 .symbolRenderingMode(.hierarchical)
@@ -117,6 +151,7 @@ struct HumdrumApp: App {
 private struct MenuBarContent: View {
     @EnvironmentObject var manager: TranscriptionManager
     @EnvironmentObject var dictation: DictationCoordinator
+    @EnvironmentObject var updater: SparkleUpdater
     @Environment(\.openWindow)   private var openWindow
     @Environment(\.openSettings) private var openSettings
 
@@ -150,6 +185,11 @@ private struct MenuBarContent: View {
                 openWindow(id: WindowID.main)
                 NSApp.activate(ignoringOtherApps: true)
             }
+
+            Button("Check for Updates…") {
+                updater.checkForUpdates()
+            }
+            .disabled(!updater.canCheck)
 
             Button("Settings…") {
                 NSApp.activate(ignoringOtherApps: true)

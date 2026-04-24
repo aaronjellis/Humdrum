@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import HumdrumCore
 
 /// Pre-meeting setup. A small, visually engaging window where the user
 /// picks quality/noise/speakers with icon tiles instead of dropdowns,
