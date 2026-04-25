@@ -2,9 +2,20 @@
 """
 Renders Humdrum's app icon as an .iconset folder of PNGs.
 
-The icon mimics the app's AudioVisualizer orb: a glowing emerald sphere
-on transparent background — same hue palette as the resting state of
-the visualizer (Color(hue: ~0.4, saturation: 0.95, brightness: 0.96)).
+The icon is an emerald AudioVisualizer orb centered on a dark squircle
+background — the same look as the in-app launch logo, sized to macOS
+Big Sur+ icon proportions (content occupies ~82% of the canvas with
+Apple's superellipse corner so it reads as a "real Mac app icon" in
+Finder / Dock / Launchpad).
+
+Why opaque instead of transparent:
+  - A transparent icon disappears into the Dock wallpaper and looks
+    half-finished next to every other app.
+  - Dark Mode dock shows light icons better; Light Mode dock shows
+    dark icons better. A dark squircle with a bright emerald orb
+    reads well in both.
+  - The in-app logo already uses this same dark-squircle-plus-orb
+    style, so the Dock → About-window transition feels continuous.
 
 We draw everything procedurally with NumPy so we don't need SVG tooling
 or CoreGraphics — just Pillow + NumPy. Output is macOS's standard
@@ -12,14 +23,16 @@ iconset layout; `iconutil -c icns` produces the final .icns from it
 at build time (see build-app.sh).
 
 Layers, inner to outer:
-  1. Deep emerald core (darker, small radius)
-  2. Main sphere body — radial gradient from emerald → teal → transparent
+  0. Dark squircle base (superellipse, near-black with a subtle
+     emerald-tinted top-down gradient)
+  1. Deep emerald core
+  2. Main sphere body — radial gradient from emerald → teal → edge
   3. Specular highlight — small, offset upper-left, near-white
-  4. Outer halo — soft bloom that extends past the sphere's edge
+  4. Outer halo — soft bloom over the squircle
 
-Alpha is composited over transparent background so the icon shows the
-Dock / Finder wallpaper through the transparent margins — matching the
-in-app orb's look.
+The outer transparent margin around the squircle is kept narrow
+(~9% per side) so macOS's own shadow/halo still sits where Apple
+expects it to.
 """
 from __future__ import annotations
 
@@ -46,6 +59,20 @@ EMERALD_HOT    = np.array([0.50, 1.00, 0.85])   # bright highlight
 EMERALD_DEEP   = np.array([0.02, 0.45, 0.30])   # shadow side
 CORE_WHITE     = np.array([0.95, 1.00, 0.98])   # specular core
 
+# --- Squircle background ---------------------------------------------
+# Near-black with a faint emerald lift at the top so the icon reads as
+# "from the Humdrum family" rather than a generic black square.
+# Matches the in-app logo's squircle fill.
+SQUIRCLE_TOP    = np.array([0.06, 0.10, 0.09])  # ~#10191
+SQUIRCLE_BOTTOM = np.array([0.02, 0.03, 0.03])  # near-black
+# Apple's macOS app-icon canvas convention: content occupies ~82% of
+# the image with ~9% padding on each side. We follow the same ratio.
+CONTENT_FRACTION = 0.824
+# Apple's icon shape is a superellipse (|x/a|^n + |y/a|^n = 1) with
+# n ≈ 5. Slightly softer than a rounded-rect, slightly firmer than
+# a circle — the "squircle" shape you see across Sonoma/Sequoia.
+SQUIRCLE_N = 5.0
+
 
 def _smoothstep(edge0, edge1, x):
     """
@@ -70,11 +97,12 @@ def render_icon(size: int) -> Image.Image:
     w = size * ss
 
     # Coordinates normalized so r=1.0 sits at the sphere's visible edge.
-    # The sphere occupies ~62% of the canvas diameter so the outer halo
-    # has room to bloom before it has to vanish at the canvas bounds.
+    # The sphere is slightly smaller than before so it has room to
+    # breathe inside the squircle — previous layout filled ~62% of the
+    # full canvas, now ~52% of the canvas (~63% of the squircle interior).
     yy, xx = np.mgrid[0:w, 0:w].astype(np.float32)
     cx = cy = (w - 1) / 2.0
-    sphere_radius_px = w * 0.31           # sphere edge
+    sphere_radius_px = w * 0.26           # sphere edge
     dx = (xx - cx) / sphere_radius_px
     dy = (yy - cy) / sphere_radius_px
     r = np.sqrt(dx * dx + dy * dy)
@@ -83,6 +111,28 @@ def render_icon(size: int) -> Image.Image:
     # using a tiny local compositor. Each layer is "src over dst".
     rgb = np.zeros((w, w, 3), dtype=np.float32)
     alpha = np.zeros((w, w), dtype=np.float32)
+
+    # ---- 0. Dark squircle background --------------------------------
+    # Superellipse mask: |x/a|^n + |y/a|^n <= 1. `a` is the half-extent
+    # in pixels based on CONTENT_FRACTION; we build a small smoothstep
+    # around the boundary for antialiasing. Then fill with a vertical
+    # emerald-to-near-black gradient so the squircle has quiet depth
+    # instead of looking flat and plastic.
+    sq_half = (w * CONTENT_FRACTION) / 2.0
+    sx = (xx - cx) / sq_half
+    sy = (yy - cy) / sq_half
+    sq_r = (np.abs(sx) ** SQUIRCLE_N + np.abs(sy) ** SQUIRCLE_N) ** (1.0 / SQUIRCLE_N)
+    # Edge AA scaled to pixel width so it stays a ~1 px transition at
+    # every size, not a blurrier one at large canvases.
+    aa = 1.5 / sq_half
+    squircle_mask = 1.0 - _smoothstep(1.0 - aa, 1.0 + aa, sq_r)
+
+    # Vertical gradient from SQUIRCLE_TOP at the top of the canvas
+    # to SQUIRCLE_BOTTOM at the bottom. Clipped to [0, 1] on the
+    # normalized y so it lines up with the squircle bounds.
+    ty = np.clip((yy / (w - 1)), 0.0, 1.0)[..., None]
+    squircle_rgb = SQUIRCLE_TOP * (1.0 - ty) + SQUIRCLE_BOTTOM * ty
+    _src_over(rgb, alpha, squircle_rgb, squircle_mask)
 
     # Mask that's 1 strictly inside the sphere, 0 outside, with a
     # narrow smoothstep over the rim for antialiasing. Computed up
