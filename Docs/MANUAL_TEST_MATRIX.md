@@ -32,9 +32,9 @@ Record a 30-second sample, read the long paragraph, stop. Confirm the transcript
 | Stop during "Finalizing…" | No crash, transcript still saves | | |
 | Start a second recording right after stopping | No multi-minute stall; second recording starts clean | | |
 
-## Mutter dictation v2 (commit-once cadence)
+## Mutter dictation v2 (utterance-paced commits, keep listening)
 
-This is the canonical Mutter matrix as of the paste-pivot. Every paste now happens once at end-of-utterance via clipboard + ⌘V — there is no more per-Whisper-commit paste loop. The bug we shipped to fix: long sentences pasted as nothing because per-commit pasteboard restores raced with Electron's lazy clipboard reads. See `mutter-paste-research.md` and `mutter-paste-pivot-plan.md` for the receipts.
+This is the canonical Mutter matrix as of the paste-pivot. Pastes now fire at human-utterance cadence: each `silenceTimeoutSeconds` of silence triggers one ⌘V of *the new tail* of the transcript (the diff against everything previously pasted), and the engine stays running so the user can keep talking into the same orb without re-arming with ⌥Space. Stay silent through both the ring-drain (phase 1) and the orb scale-down (phase 2) and the session ends, with any unflushed tail-pass text pasted at teardown. The bug this design fixes: long sentences used to paste as nothing because per-Whisper-commit pasteboard restores raced with Electron's lazy clipboard reads — utterance-paced commits give each clipboard restore time to resolve before the next paste arrives. See `mutter-paste-research.md` and `mutter-paste-pivot-plan.md` for the receipts.
 
 ### What to verify on each cell
 
@@ -42,7 +42,7 @@ For each target app: focus a text field, press ⌥Space, read the test phrase al
 
 1. **Orb has constant breathing motion.** Even before you speak, the orb should subtly pulse + drift in 2D — that's the always-on "engine is running" signal. The motion is small (~3% scale, ±1 pt drift) but visible peripherally. If the orb sits perfectly still, the timeline-driven aberration helpers are broken.
 2. **"Listening…" indicator only while you're speaking.** The dots should fade in within one frame of you starting to talk and fade out within ~300 ms once you go quiet. They should NOT be visible during pre-speech silence or thinking pauses — only while audio is actively detected. The orb's breathing covers the "is it on?" question; the dots cover "is it hearing me?"
-3. **Paste lands at end of phase 1, not phase 2.** Stop talking. The countdown ring drains over your configured `silenceTimeoutSeconds`. The moment it reaches zero, the entire transcript should appear in your focused field as a single ⌘V. The orb should *then* scale down to nothing over another `silenceTimeoutSeconds` as a courtesy fade — by then your text is already in place. Speaking during the ring drain snaps the orb back to full and resets the ring; speaking during the post-paste fade does NOT reactivate dictation (the text is already pasted; press ⌥Space again for a new capture).
+3. **Paste lands at end of phase 1; engine keeps listening through phase 2.** Stop talking. The countdown ring drains over your configured `silenceTimeoutSeconds` (phase 1). The moment it reaches zero, the new tail of the transcript should appear in your focused field as a single ⌘V. The orb should *then* begin scaling down 1.0 → 0 over another `silenceTimeoutSeconds` (phase 2) — but the engine is still hot. Start talking again during the fade and the orb should snap back to full size, the ring should re-arm, and the next phase-1 boundary should paste only the *new* tail (no double-paste of what already landed). Stay silent through the full 2T window and the orb disappears for good — any text the live stream hadn't surfaced yet flushes via the `stop()` snapshot pass at that moment, so you should never lose a tail. Hotkey-stop also flushes the diff before tearing down, so a quick ⌥Space after a fast utterance shouldn't lose the final words.
 4. **No StatusPill in the happy path.** The pill should only appear if Accessibility is missing, the cascade refused, or AX detected a silent drop.
 5. **`.silentDrop` pill on Electron silent-drop targets.** Where the receiving app eats the ⌘V (some Electron / hardened web views), the pill should appear with copy "That app didn't take the paste — ⌘V to insert" and the dictation text should still be on the clipboard for at least 3.5 seconds afterwards.
 6. **Clipboard preservation.** The user's prior clipboard contents should be restored ~3 seconds after a successful paste; in the failure path, the dictation text should remain on the clipboard so the manual ⌘V works.
@@ -75,7 +75,8 @@ For each target app: focus a text field, press ⌥Space, read the test phrase al
 
 | Scenario | Pass criteria | Last checked | Notes |
 |---|---|---|---|
-| Long monologue (45+ words, the original bug) | Single ⌘V lands the entire transcript at end | | |
+| Long monologue (45+ words, the original bug) | Diff-paste lands at each phase-1 boundary; final stop() flush pastes any remaining tail; nothing is duplicated | | |
+| Two-utterance session (speak, pause 3s, speak again, pause to stop) | First ⌘V at first pause; second ⌘V at second pause is *only the new tail*; nothing duplicated; final teardown adds nothing extra | | |
 | 1Password master-password field | Cascade refuses; orb fades; **no** failure pill | | |
 | Banking site password field | Same as 1Password | | |
 | Accessibility revoked mid-dictation | StatusPill flips to "Grant Accessibility…" without restart | | |

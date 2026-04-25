@@ -124,31 +124,30 @@ struct DictationOverlayView: View {
         VStack(spacing: 8) {
             // Single TimelineView drives every continuous animation:
             // the orb's breathing/aberration motion, the chunk-pulse
-            // confirmation flash, the silence-countdown ring, and the
-            // post-paste wind-down scale. One timeline source means
+            // confirmation flash, the silence-countdown ring, and
+            // the still-listening fade. One timeline source means
             // everything is rendered from the same `now`, so phases
             // stay perfectly aligned with the engine's silence
             // monitor (which uses the same `lastSpeechTime` anchor).
             //
-            // Wind-down model:
-            //   Phase 1 — `[0, T]`: full-size orb, ring drains.
-            //             T = `silenceTimeoutSeconds`. At elapsed = T
-            //             the silence monitor fires `stop()` →
-            //             snapshot finalize → ⌘V paste lands.
-            //   Phase 2 — `[T, 2T]`: post-paste wind-down. The orb
-            //             scales 1.0 → 0 across `stop()`'s linger
-            //             window. The engine is already stopped and
-            //             the text is in the focused field; this is
-            //             a courtesy fade only.
-            //
-            // The user-facing meaning of `silenceTimeoutSeconds` is
-            // "how long of silence triggers the paste" — paste
-            // happens at T, not 2T. The phase-2 visual is purely
-            // cosmetic teardown. (Earlier iterations let users speak
-            // during phase 2 to reactivate; that affordance was
-            // removed when we moved paste to end-of-phase-1, since
-            // the text has already been delivered by the time phase 2
-            // starts and continuing would require another paste.)
+            // Cadence model (T = `silenceTimeoutSeconds`):
+            //   Phase 1 — `[0, T]`: full-size orb, ring drains. At
+            //             elapsed = T the silence monitor fires
+            //             `commitAndPaste()` → the diff of
+            //             confirmedText since the last commit lands
+            //             in the focused field via ⌘V. The engine
+            //             stays running.
+            //   Phase 2 — `[T, 2T]`: still-listening fade. The orb
+            //             scales 1.0 → 0 to telegraph "I'm winding
+            //             down — speak now or I'll close." If the
+            //             user starts talking, `lastSpeechTime`
+            //             snaps to now, the orb springs back to
+            //             full size, the ring re-arms, and the
+            //             next phase-1 boundary will produce a
+            //             fresh diff paste of just the new text.
+            //             Stay silent through the full window and
+            //             `stop()` runs at 2T (which flushes any
+            //             remaining tail-pass diff and tears down).
             TimelineView(.animation(minimumInterval: 1.0 / 60.0)) { timeline in
                 let scale = windDownScale(now: timeline.date)
                 let breath = breathingScale(now: timeline.date)
@@ -254,18 +253,19 @@ struct DictationOverlayView: View {
         return .degrees(sin(t * 2 * .pi / 6.1) * 0.6)
     }
 
-    /// Phase-2 (wind-down) orb scale. See `body` for the model:
-    /// returns 1.0 throughout phase 1 and the no-speech-yet window,
-    /// then linearly shrinks 1.0 → 0 across phase 2 once the
-    /// configured silence timeout has elapsed since last speech.
+    /// Phase-2 (still-listening fade) orb scale. See `body` for the
+    /// model: returns 1.0 throughout phase 1 and the no-speech-yet
+    /// window, then linearly shrinks 1.0 → 0 across phase 2 once
+    /// the configured silence timeout has elapsed since last speech.
     ///
-    /// Under the commit-at-phase-1 cadence (post-paste-pivot v2), this
-    /// scale animates during `stop()`'s linger after the paste has
-    /// already landed — the engine is stopped, `lastSpeechTime` is
-    /// frozen, and elapsed naturally crosses into the phase 2 window.
-    /// The "speak again to reactivate" affordance from the previous
-    /// design is intentionally gone: by the time the user could speak
-    /// again the paste is already in their focused field.
+    /// Under the keep-listening diff-paste cadence, the engine is
+    /// still running through phase 2 — the shrinking orb is the
+    /// affordance that says "speak now or I'll close." If the user
+    /// starts talking, `lastSpeechTime` advances and `elapsed` falls
+    /// back into phase 1, so the scale springs back to 1.0 and the
+    /// next silence boundary triggers a fresh diff paste. The orb
+    /// only actually disappears when `stop()` runs (at 2T on the
+    /// silence path, or immediately on hotkey).
     private func windDownScale(now: Date) -> CGFloat {
         // Pre-speech window: hold full size; the no-speech timeout
         // fires its own teardown without a visual wind-down.
@@ -293,12 +293,14 @@ struct DictationOverlayView: View {
     }
 
     /// Ring that expands outward from the orb edge and fades out when
-    /// the dictation's transcript has just been pasted into the focused
-    /// field. Under commit-once cadence this fires exactly once per
-    /// dictation, on success — a single satisfying confirmation flash.
-    /// (Function and trigger field names still say "chunk" for legacy
-    /// reasons; the pulse animation is identical to what we used in
-    /// the streaming-paste era when it fired per Whisper commit.)
+    /// the dictation's transcript has just been pasted into the
+    /// focused field. Fires once per phase-1 commit on success —
+    /// users with multi-utterance sessions will see one pulse per
+    /// commit boundary, which matches their internal sense of "I
+    /// just finished a thought and it landed." (Function and
+    /// trigger field names still say "chunk" for legacy reasons;
+    /// the pulse animation is identical to what we used in the
+    /// streaming-paste era when it fired per Whisper commit.)
     @ViewBuilder
     private func chunkPulse(now: Date) -> some View {
         if let pastedAt = dictation.lastChunkPastedAt {

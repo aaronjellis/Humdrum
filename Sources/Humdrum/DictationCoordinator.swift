@@ -6,36 +6,44 @@ import AVFoundation
 import Carbon.HIToolbox
 import HumdrumCore
 
-/// Orchestrates Whisper Flow-style dictation, commit-once.
+/// Orchestrates Whisper Flow-style dictation, utterance-paced commits.
 ///
 ///   Press ⌥Space → orb appears centered on screen → speak → after
-///   `silenceTimeoutSeconds` of silence the countdown ring drains and
-///   we immediately stop, finalize, and paste the entire transcript
-///   into the focused field as a single ⌘V. The orb then visually
-///   winds down (scales 1.0 → 0 over another `silenceTimeoutSeconds`)
-///   purely as a courtesy fade — the engine is already stopped and
-///   the paste has already landed by then. Speaking during the
-///   countdown resets the timer; speaking during the post-paste fade
-///   does not — at that point you'd press ⌥Space to start a new
-///   dictation. The user's complaint that drove this design was "the
-///   text appears too late": commit-at-phase-1-end means the user
-///   sees their text the moment the ring drains, not silenceTimeout
-///   seconds later.
+///   `silenceTimeoutSeconds` of silence (phase 1, the countdown ring
+///   draining) we paste *the new tail* of the transcript into the
+///   focused field — but the engine stays hot. The orb then begins
+///   its scale-down (phase 2, another `silenceTimeoutSeconds`) as a
+///   "still listening, but about to give up" affordance. Speaking
+///   during phase 2 snaps the orb back to full and resets the
+///   countdown — the next phase-1 boundary will paste only the
+///   *new* tail (we track `pastedCharCount` against Whisper's
+///   monotonic confirmedText). Stay silent through both phases and
+///   we tear down via `stop()`, which flushes any final tail-pass
+///   text the live stream hadn't surfaced yet. Hotkey stop also
+///   flushes the diff so a quick ⌥Space-tap doesn't lose anything
+///   that arrived after the last phase-1 commit. The user's
+///   original complaint that drove the diff design: the previous
+///   single-commit-at-2T cadence meant "the text appears too late"
+///   AND killed the orb after one utterance — paste-and-keep-
+///   listening fixes both.
 ///
 /// Text goes in via clipboard + ⌘V. See `PasteHelper` for the
 /// rationale (short version: ⌘V is the OS-blessed insertion event
 /// every mainstream target accepts, where synthetic unicode key
 /// events get silently filtered by Electron renderers).
 ///
-/// Why commit-once instead of paste-as-you-go: the streaming-paste
-/// path used to fire one clipboard write + ⌘V per Whisper commit,
-/// which produced overlapping pasteboard restores that raced with
-/// Electron's lazy clipboard reads. On long dictations the receiver
-/// would consistently land on the *restored* clipboard contents and
-/// nothing would paste at all. Every shipping competitor (Wispr
-/// Flow, Superwhisper, VoiceInk, Aqua Voice) pastes exactly once at
-/// end of utterance for the same reason; see
-/// `docs/mutter-paste-research.md` for the receipts.
+/// Why diff-paste instead of per-Whisper-commit paste: the old
+/// streaming-paste path fired one clipboard write + ⌘V per Whisper
+/// commit, which produced overlapping pasteboard restores that
+/// raced with Electron's lazy clipboard reads. On long dictations
+/// the receiver would consistently land on the *restored*
+/// clipboard contents and nothing would paste at all. Diff-paste
+/// at phase 1 boundaries fires at human-utterance cadence (every
+/// few seconds at most), giving each clipboard restore time to
+/// resolve before the next paste arrives, while still letting the
+/// user keep talking into the same orb session. See
+/// `docs/mutter-paste-research.md` for the receipts on why
+/// per-commit pasting was unsalvageable.
 ///
 /// Uses the shared TranscriptionManager but temporarily overrides its
 /// session-completion callback + settings so dictations aren't saved as
@@ -50,12 +58,12 @@ final class DictationCoordinator: ObservableObject {
 
     /// Timestamp of the most recent successful paste into the focused
     /// field. The overlay watches this to flash a short ring-pulse
-    /// around the orb when paste lands — under the new commit-once
-    /// cadence this fires exactly once per dictation, on success, at
-    /// the moment the final transcript is delivered to the focused
-    /// field. The orb's existing pulse animation handles either one
-    /// or many triggers gracefully, so we get a single satisfying
-    /// confirmation flash for free.
+    /// around the orb when paste lands. Fires on each phase-1
+    /// commit boundary that successfully delivers text — single-
+    /// utterance sessions see one pulse, multi-utterance sessions
+    /// see one per commit. The orb's existing pulse animation
+    /// handles either case gracefully, so each commit gets its own
+    /// satisfying confirmation flash for free.
     @Published private(set) var lastChunkPastedAt: Date?
 
     /// Outcome of the most recent dictation's paste, surfaced to the
@@ -68,14 +76,16 @@ final class DictationCoordinator: ObservableObject {
     /// Timestamp of the most recent detected speech. Drives several
     /// things in the overlay:
     ///   • The silence-countdown ring drains over `silenceTimeoutSeconds`
-    ///     (phase 1). When elapsed reaches `silenceTimeoutSeconds`
-    ///     the silence monitor fires `stop()` — that's when paste
-    ///     lands.
-    ///   • The post-paste wind-down (phase 2) keeps using this anchor
-    ///     to drive the orb's 1.0 → 0 scale: by the time stop()'s
-    ///     linger is running, `lastSpeechTime` is frozen and elapsed
-    ///     keeps growing past `silenceTimeoutSeconds`, so the
-    ///     scale function naturally animates the fade.
+    ///     (phase 1). At elapsed = T the silence monitor fires
+    ///     `commitAndPaste()` — that's when the new tail of the
+    ///     transcript lands in the focused field.
+    ///   • The post-commit "still listening" fade (phase 2,
+    ///     [T, 2T]) keeps using this anchor to drive the orb's
+    ///     1.0 → 0 scale: speaking during the fade resets
+    ///     `lastSpeechTime` to now, the orb springs back to full,
+    ///     and the next phase-1 boundary produces a fresh diff
+    ///     paste. Sit silent through the full 2T window and
+    ///     `stop()` runs.
     ///   • The Listening… indicator inside the orb checks freshness
     ///     against this anchor — fades in fast when it's recent,
     ///     fades out within ~400ms once silence resumes.
@@ -141,6 +151,34 @@ final class DictationCoordinator: ObservableObject {
     private var silenceTask: Task<Void, Never>?
     private var tccObserver: NSObjectProtocol?
     private var accessibilityPollTimer: Timer?
+
+    /// Cumulative count of characters from `manager.confirmedText` that
+    /// have already been pasted into the focused field. Each phase-1
+    /// commit pastes only the suffix `confirmedText.dropFirst(pastedCharCount)`,
+    /// then advances this counter. Reset to zero on each fresh `start()`.
+    /// Relies on Whisper's confirmedText being append-only, which it is
+    /// for the stable-confirmed stream (the hypothesis tail is rewritten
+    /// freely, but confirmed text only grows).
+    private var pastedCharCount: Int = 0
+
+    /// Set while a phase-1 commit's paste/verify cycle is in flight, so
+    /// the silence monitor's 200 ms tick doesn't double-fire
+    /// `commitAndPaste()` while the previous one is still resolving its
+    /// post-paste AX verification. Cleared in the deferred block of
+    /// `commitAndPaste()`.
+    private var commitInProgress: Bool = false
+
+    /// Tracks the currently-armed +3.5 s clipboard-re-write Task on the
+    /// failure path. Each new commit cancels the prior task before
+    /// arming its own — without this, a previous commit's preserved
+    /// text could clobber the current commit's clipboard 3.5 s into
+    /// the next utterance, and the user would ⌘V the wrong dictation.
+    /// Deliberately NOT cancelled on `stop()` — if the final flush
+    /// failed, the user needs the preserved text on their clipboard
+    /// for several seconds after the orb disappears so ⌘V works.
+    /// Cancelled on the next `start()` instead, which is the
+    /// earliest moment a stale task could harm a live clipboard.
+    private var clipboardPreservationTask: Task<Void, Never>?
 
     // MARK: - Init
 
@@ -334,6 +372,10 @@ final class DictationCoordinator: ObservableObject {
         lastSpeechTime = nil
         lastChunkPastedAt = nil
         sessionStartedAt = Date()
+        pastedCharCount = 0
+        commitInProgress = false
+        clipboardPreservationTask?.cancel()
+        clipboardPreservationTask = nil
 
         // Show the orb IMMEDIATELY so the user gets feedback, even if
         // we need a few seconds to load the model first. The overlay
@@ -472,11 +514,24 @@ final class DictationCoordinator: ObservableObject {
         // Resolve the final text. Prefer the snapshot's transcript
         // (which includes anything that only landed via the tail pass);
         // fall back to live `confirmedText` if the snapshot timed out.
-        // Trim trailing whitespace — Whisper sometimes leaves a
-        // hanging space after the last token, and we don't want
-        // that landing in the user's focused field.
+        // Then slice off the prefix that earlier phase-1 commits
+        // already pasted — we only want to flush whatever new tail
+        // arrived between the last commit and teardown. Trim
+        // trailing whitespace; Whisper occasionally leaves a hanging
+        // space after the last token.
         let rawText = snapshot?.transcriptText ?? manager.confirmedText
-        let finalText = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let pendingTail: String
+        if pastedCharCount >= rawText.count {
+            pendingTail = ""
+        } else {
+            let startIdx = rawText.index(
+                rawText.startIndex,
+                offsetBy: pastedCharCount,
+                limitedBy: rawText.endIndex
+            ) ?? rawText.endIndex
+            pendingTail = String(rawText[startIdx...])
+        }
+        let finalText = pendingTail.trimmingCharacters(in: .whitespacesAndNewlines)
 
         if finalText.isEmpty {
             // User hit ⌥Space twice with nothing said, or speech
@@ -518,15 +573,21 @@ final class DictationCoordinator: ObservableObject {
         // beat the restore for slower users). See the research memo
         // for the race details.
         //
+        // Cancel any in-flight preservation Task from a prior phase-1
+        // commit before arming our own, otherwise the older task
+        // would clobber the clipboard 3.5s into teardown.
+        //
         // We accept the known cosmetic cost: heavy clipboard managers
         // (Alfred, Raycast, Paste) may show a transient duplicate
         // entry for the dictation text. Acceptable trade for never
         // silently losing a dictation.
         if !finalText.isEmpty, pasteOutcome != .succeeded {
+            clipboardPreservationTask?.cancel()
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(finalText, forType: .string)
-            Task { @MainActor in
+            clipboardPreservationTask = Task { @MainActor in
                 try? await Task.sleep(nanoseconds: 3_500_000_000)
+                guard !Task.isCancelled else { return }
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(finalText, forType: .string)
             }
@@ -544,29 +605,21 @@ final class DictationCoordinator: ObservableObject {
         manager.vocabularyHints = savedVocabHints
         manager.commitThresholds = savedCommitThresholds
 
-        // Outcome- and reason-dependent orb linger.
+        // Outcome-dependent orb linger.
         //
-        //   • Silence-timeout success: hold the orb up for one
-        //     `silenceTimeoutSeconds`. `lastSpeechTime` is frozen at
-        //     this point, so the overlay's `windDownScale` naturally
-        //     animates the orb 1.0 → 0 across the linger window —
-        //     this is the post-paste phase 2 wind-down visual.
-        //   • Hotkey or no-speech success: 250 ms — the user explicitly
-        //     stopped (or never started talking), so a long fade reads
-        //     as sticky.
-        //   • Any failure: 4.5 s so the failure pill is readable and
-        //     actionable before the orb disappears.
-        let lingerNs: UInt64
-        if pasteOutcome == .succeeded {
-            switch reason {
-            case .silenceTimeout:
-                lingerNs = UInt64(silenceTimeoutSeconds * 1_000_000_000)
-            case .hotkey, .noSpeechTimeout:
-                lingerNs = 250_000_000
-            }
-        } else {
-            lingerNs = 4_500_000_000
-        }
+        // On success, 250 ms — enough for the final flush ⌘V to
+        // paint and the confirmation ring-pulse to be visible
+        // without the orb feeling sticky. By the time `stop()` runs
+        // on the silence path the orb has already animated through
+        // the phase 2 scale-down (1.0 → 0 over [T, 2T]) — that's
+        // the visible "still listening, but giving up" cue that
+        // resolves into a near-zero orb just as we land here. On
+        // hotkey stops the user is yanking the orb intentionally,
+        // so the abrupt 250 ms exit is fine.
+        //
+        // On failure, 4.5 s so the failure pill is readable and
+        // actionable before the orb disappears.
+        let lingerNs: UInt64 = (pasteOutcome == .succeeded) ? 250_000_000 : 4_500_000_000
         try? await Task.sleep(nanoseconds: lingerNs)
 
         overlay.hide()
@@ -597,6 +650,98 @@ final class DictationCoordinator: ObservableObject {
         try? await Task.sleep(nanoseconds: 250_000_000)
         guard let after = PasteHelper.focusedTextLength() else { return .succeeded }
         return (after - before) >= text.count ? .succeeded : .silentDrop
+    }
+
+    // MARK: - Phase-1 commit
+
+    /// Phase-1 paste: at the end of the silence countdown, paste the
+    /// new tail of `manager.confirmedText` (everything since
+    /// `pastedCharCount`) and advance the counter, leaving the engine
+    /// running so the user can continue dictating into the same
+    /// session. The orb's phase 2 fade plays out from here; speaking
+    /// during it resets `lastSpeechTime`, which snaps the orb back to
+    /// full size and arms the next phase-1 commit on the next silence.
+    ///
+    /// Why slice on UTF-16 character offsets and not, say, words or
+    /// Whisper segment boundaries: `confirmedText` is the canonical
+    /// monotonic stream Whisper has decided to lock in — it only ever
+    /// grows, never gets rewritten (the hypothesis tail is what gets
+    /// rewritten). So a simple "what's after the last paste's
+    /// length" diff is correct by construction. We don't need the
+    /// `WordStream` diff machinery here because there's no
+    /// hypothesis-overlap problem at phase-1 boundaries: by then
+    /// `silenceTimeoutSeconds` of silence has elapsed, and Whisper
+    /// has had ample chances to promote any reasonable hypothesis
+    /// into confirmedText.
+    ///
+    /// Race-safety: `commitInProgress` gates re-entry from the 200 ms
+    /// silence monitor tick. The check + set happens on @MainActor in
+    /// a single sync run, so there's no TOCTOU window. We always
+    /// advance `pastedCharCount` to the snapshot count even on paste
+    /// failure — retry-as-bigger-diff is worse than letting the
+    /// failure-path clipboard preservation be the recovery vehicle.
+    private func commitAndPaste() async {
+        guard !commitInProgress, isDictating else { return }
+        commitInProgress = true
+        defer { commitInProgress = false }
+
+        // Snapshot now — `confirmedText` is observable and could grow
+        // mid-paste if Whisper finalizes another segment while we're
+        // awaiting the AX verification. We paste exactly the slice
+        // we measured, and advance the counter to that measured
+        // length (not the live length) so anything that lands during
+        // the await gets picked up by the next phase-1 commit.
+        let confirmedSnapshot = manager.confirmedText
+        let snapshotCount = confirmedSnapshot.count
+        guard snapshotCount > pastedCharCount else { return }
+
+        let startIdx = confirmedSnapshot.index(
+            confirmedSnapshot.startIndex,
+            offsetBy: pastedCharCount,
+            limitedBy: confirmedSnapshot.endIndex
+        ) ?? confirmedSnapshot.endIndex
+        let pendingTail = String(confirmedSnapshot[startIdx...])
+        let trimmed = pendingTail.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // The diff was pure whitespace — no user-visible text to
+        // paste, but advance the counter so we don't keep
+        // re-entering on the next monitor tick.
+        if trimmed.isEmpty {
+            pastedCharCount = snapshotCount
+            return
+        }
+
+        let baselineLength = PasteHelper.focusedTextLength()
+        let result = PasteHelper.paste(trimmed)
+        switch result {
+        case .inserted:
+            pasteOutcome = await verifyInsertion(trimmed, before: baselineLength)
+            if pasteOutcome == .succeeded {
+                lastChunkPastedAt = Date()
+            }
+            pastedCharCount = snapshotCount
+        case .failed:
+            pasteOutcome = .failed
+            refreshAccessibilityStatus()
+            pastedCharCount = snapshotCount
+        }
+
+        // Failure-path clipboard preservation, mirroring `stop()`.
+        // Cancel any in-flight preservation Task from a previous
+        // commit before arming our own — otherwise consecutive
+        // failures could race their +3.5 s rewrites and leave stale
+        // text on the clipboard.
+        if pasteOutcome != .succeeded {
+            clipboardPreservationTask?.cancel()
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(trimmed, forType: .string)
+            clipboardPreservationTask = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 3_500_000_000)
+                guard !Task.isCancelled else { return }
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(trimmed, forType: .string)
+            }
+        }
     }
 
     // MARK: - Silence monitor
@@ -632,20 +777,36 @@ final class DictationCoordinator: ObservableObject {
             return
         }
 
-        // Had speech already — check the "stopped talking" timeout.
-        // Auto-stop fires at exactly `silenceTimeoutSeconds` so the
-        // paste lands the moment the countdown ring drains. The
-        // post-paste wind-down (orb scaling 1.0 → 0 — see
-        // `DictationOverlayView.windDownScale`) plays out during
-        // `stop()`'s linger, but by then the engine is already
-        // stopped and the text is already in the focused field.
-        // Speaking during phase 1 advances `lastSpeechTime`, resetting
-        // the elapsed back to zero. Speaking during the post-paste
-        // fade does NOT reactivate dictation — at that point the user
-        // taps ⌥Space again to start a fresh capture.
-        if let last = lastSpeechTime,
-           Date().timeIntervalSince(last) >= silenceTimeoutSeconds {
+        // Had speech already — two thresholds:
+        //
+        //   • At elapsed = T (`silenceTimeoutSeconds`): the countdown
+        //     ring has fully drained — fire `commitAndPaste()`. This
+        //     pastes whatever new text has accumulated since the last
+        //     paste (the *diff* of `manager.confirmedText`); engine
+        //     stays hot.
+        //   • At elapsed = 2T: full teardown via `stop()`. The user
+        //     stayed silent through both the ring drain AND the
+        //     post-commit fade window, so we shut down.
+        //
+        // Speaking during *either* phase advances `lastSpeechTime`,
+        // resetting elapsed to zero — the orb springs back to full
+        // size, the ring re-engages, and the next phase-1 boundary
+        // produces a fresh paste of just the new text. This is the
+        // "commit-and-keep-listening" affordance: a long dictation
+        // becomes a sequence of utterance-sized commits without ever
+        // losing focus.
+        guard let last = lastSpeechTime else { return }
+        let silenceElapsed = Date().timeIntervalSince(last)
+
+        if silenceElapsed >= silenceTimeoutSeconds * 2 {
             Task { await self.stop(reason: .silenceTimeout) }
+            return
+        }
+
+        if silenceElapsed >= silenceTimeoutSeconds,
+           !commitInProgress,
+           manager.confirmedText.count > pastedCharCount {
+            Task { await self.commitAndPaste() }
         }
     }
 
