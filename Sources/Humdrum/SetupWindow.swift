@@ -38,6 +38,16 @@ struct SetupWindow: View {
         }
         .frame(minWidth: 560, idealWidth: 580, minHeight: 620)
         .preferredColorScheme(.dark)
+        // Reset the `starting` guard every time the window appears.
+        //
+        // Setup is a SwiftUI Window with a stable id (.setup) — the
+        // view tree survives dismiss/reopen, which means local @State
+        // persists across sessions. If startRecording()'s Task ever
+        // exits without hitting `starting = false` (crash, unhandled
+        // error, user force-quit mid-load), the next time the user
+        // opens Setup the Start button is stuck disabled. Resetting
+        // on appear scopes the guard to a single Start press.
+        .onAppear { starting = false }
     }
 
     // MARK: Header

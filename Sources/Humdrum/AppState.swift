@@ -198,11 +198,23 @@ final class AppState: ObservableObject {
             in: folder
         )
 
-        do {
-            try TranscriptExporter.write(session: session, format: format, to: url)
-            lastAutoSaveURL = url
-        } catch {
-            autoSaveFailureAlert(reason: error.localizedDescription)
+        // Disk write happens off-main so a slow volume (SMB share,
+        // spinning disk, network-mounted Dropbox folder) can't freeze
+        // the UI for the second or two it takes to flush. The in-app
+        // session is already saved at this point; this is only about
+        // the side-car file in the user's chosen folder.
+        Task.detached(priority: .utility) { [weak self] in
+            do {
+                try TranscriptExporter.write(session: session, format: format, to: url)
+                await MainActor.run { [weak self] in
+                    self?.lastAutoSaveURL = url
+                }
+            } catch {
+                let reason = error.localizedDescription
+                await MainActor.run { [weak self] in
+                    self?.autoSaveFailureAlert(reason: reason)
+                }
+            }
         }
     }
 

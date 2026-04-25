@@ -11,20 +11,38 @@ struct RecorderWindowStyler: NSViewRepresentable {
         let view = NSView()
         DispatchQueue.main.async {
             guard let window = view.window else { return }
-            // Force a truly borderless window — SwiftUI's
-            // .windowStyle(.hiddenTitleBar) still reserves a few pixels
-            // of window gutter at top and bottom. Replacing the style
-            // mask outright removes all of that. We don't need standard
-            // controls (traffic lights, titlebar drag, resize) because
-            // we supply our own close X + stop button.
-            window.styleMask = [.borderless, .fullSizeContentView]
-            window.titleVisibility = .hidden
-            window.titlebarAppearsTransparent = true
-            // Drag by body. A borderless floating widget has no title
-            // bar for the user to grab, so without these flags the
-            // window is pinned in place. Buttons inside the view (stop,
-            // close) intercept their own clicks first, so drag only
-            // kicks in on empty areas of the card.
+            // IMPORTANT: do NOT override styleMask here.
+            //
+            // The Window declaration in HumdrumApp already sets
+            // `.windowStyle(.hiddenTitleBar)` which gives us exactly what
+            // we want: a titled window (so it can become key, so SwiftUI
+            // Buttons inside actually fire) with the title bar visually
+            // hidden and `.fullSizeContentView` extending the card
+            // edge-to-edge.
+            //
+            // We previously tried:
+            //   • `.borderless, .fullSizeContentView` — silently broke
+            //     every button inside, because borderless NSWindows
+            //     return `canBecomeKey = false` by default and clicks
+            //     get eaten by window-activation / drag handling.
+            //   • `.titled, .fullSizeContentView` — buttons worked, but
+            //     dropping `.closable` / `.resizable` / `.miniaturizable`
+            //     broke `dismissWindow(id: .recorder)` so the widget
+            //     wouldn't close on Stop.
+            //
+            // Leaving the SwiftUI-managed styleMask alone fixes both.
+            // We only need to hide the traffic lights (SwiftUI leaves
+            // them present but the `.hiddenTitleBar` chrome is already
+            // invisible — belt-and-suspenders).
+            window.standardWindowButton(.closeButton)?.isHidden = true
+            window.standardWindowButton(.miniaturizeButton)?.isHidden = true
+            window.standardWindowButton(.zoomButton)?.isHidden = true
+            // Drag by body. Without a visible title bar the user has
+            // nothing to grab by default; `isMovableByWindowBackground`
+            // makes empty areas of the card act as drag handles. SwiftUI
+            // Buttons report `mouseDownCanMoveWindow = false` via their
+            // underlying NSControl chain, so clicks on Stop / close fire
+            // the action rather than starting a drag.
             window.isMovable = true
             window.isMovableByWindowBackground = true
             window.backgroundColor = .clear
@@ -102,7 +120,10 @@ struct RecorderWidget: View {
             }
 
             // Familiar close affordance in the top-right of the card.
-            // Same effect as Stop: save the transcript and hide.
+            // DISTINCT from Stop: this discards the in-progress
+            // transcript rather than saving it. Stop (the big red
+            // button) saves. We prompt for confirmation below if
+            // there's anything to lose.
             closeXButton
                 .padding(8)
         }
@@ -112,10 +133,21 @@ struct RecorderWidget: View {
         // Fill the whole window — no slice of empty chrome peeking through
         // above the card.
         .ignoresSafeArea()
+        // Reset the `closing` guard every time the widget appears.
+        //
+        // The recorder Window has a stable id (.recorder) and is a
+        // SwiftUI singleton — the view tree survives dismiss/reopen.
+        // That means `@State private var closing` persists across
+        // sessions: press Stop in session 1 → `closing = true` → widget
+        // dismisses → open session 2 → widget reappears with `closing`
+        // still true → `.disabled(closing)` disables both Stop and the
+        // close X. Resetting on appear scopes the guard to a single
+        // Stop press rather than leaking into future sessions.
+        .onAppear { closing = false }
     }
 
     private var closeXButton: some View {
-        Button(action: stop) {
+        Button(action: cancel) {
             Image(systemName: "xmark")
                 .font(.system(size: 9, weight: .bold))
                 .foregroundStyle(AppTheme.textSecondary)
@@ -126,7 +158,7 @@ struct RecorderWidget: View {
                 .overlay(Circle().stroke(AppTheme.border, lineWidth: 0.5))
         }
         .buttonStyle(.plain)
-        .help("Stop and save")
+        .help("Discard recording")
         .disabled(closing)
     }
 
@@ -205,12 +237,22 @@ struct RecorderWidget: View {
     /// Status text shown in the ticker line. Reflects the manager's
     /// current lifecycle phase so the user isn't staring at a stale
     /// "Listening…" while the model is still loading.
+    ///
+    /// When none of the lifecycle flags match, fall through to the
+    /// manager's `status` string rather than a generic "Ready." — most
+    /// silent-fail paths in `manager.start()` (mic denied, model not
+    /// loaded, finalizer still running) set `status` to an actionable
+    /// message but leave all the flags false, which previously read as
+    /// "Ready." in the widget. That gave no clue why recording hadn't
+    /// started.
     private var tickerText: String {
         if !manager.currentLine.isEmpty { return manager.currentLine }
         if manager.isLoadingModel       { return "Preparing model…" }
         if manager.isFinalizing         { return "Finalizing…" }
         if manager.isRecording          { return "Listening…" }
-        return "Ready."
+        // Initial boot state — the manager hasn't done anything yet.
+        if manager.status == "Initializing…" { return "Ready." }
+        return manager.status
     }
 
     // MARK: Stop
@@ -231,5 +273,55 @@ struct RecorderWidget: View {
         Task {
             await manager.stop()
         }
+    }
+
+    // MARK: Cancel (discard)
+
+    /// Close the widget WITHOUT saving the in-progress transcript.
+    /// Prompts for confirmation when there's actual content to lose;
+    /// silently closes when the session is empty (user hit record, said
+    /// nothing, and bailed — no reason to bother them with a dialog).
+    ///
+    /// `manager.cancel()` is the fast-path teardown: skips the trailing
+    /// Whisper pass, doesn't emit `onSessionCompleted`, so AppState
+    /// never sees the session and nothing is persisted.
+    private func cancel() {
+        guard !closing else { return }
+
+        let hasContent = !manager.confirmedText
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty
+
+        if hasContent {
+            let alert = NSAlert()
+            alert.messageText = "Discard this recording?"
+            alert.informativeText =
+                "The transcript captured so far will be permanently deleted. "
+                + "If you want to save it, click Stop instead."
+            alert.alertStyle = .warning
+            // Primary-position button is "Keep Recording" so an
+            // accidental Return keypress in the alert doesn't destroy
+            // the transcript. User has to deliberately pick Discard.
+            alert.addButton(withTitle: "Keep Recording")
+            let discardButton = alert.addButton(withTitle: "Discard")
+            discardButton.hasDestructiveAction = true
+
+            // Default (first) button is Keep; Escape should also be
+            // the safe action. macOS maps the second-button default
+            // to Escape when no explicit key-equivalent is set.
+            guard alert.runModal() == .alertSecondButtonReturn else {
+                return
+            }
+        }
+
+        closing = true
+
+        openWindow(id: WindowID.main)
+        NSApp.activate(ignoringOtherApps: true)
+        dismissWindow(id: WindowID.recorder)
+
+        // Synchronous — `cancel()` doesn't run finalize, it just tears
+        // down state. No need to wrap in a Task.
+        manager.cancel()
     }
 }

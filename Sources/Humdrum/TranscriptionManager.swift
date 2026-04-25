@@ -71,6 +71,54 @@ struct TranscriptCommit: Identifiable {
     var speakerLabel: String?   // "Speaker 1", "Speaker 2", nil if unlabeled
 }
 
+// MARK: - Commit thresholds
+//
+// How long a Whisper window must grow before we emit a committed chunk.
+// Meeting mode prefers fewer chunk boundaries (long monologues read
+// better with fewer mid-sentence splits). Dictation mode prefers fast
+// feedback so the user sees their words land in the focused field as
+// they speak, not in four-second bursts.
+//
+// These can be swapped at runtime via `TranscriptionManager.commitThresholds`.
+struct CommitThresholds: Equatable {
+    /// Minimum window duration (seconds) before a commit will fire at
+    /// all, regardless of silence. Below this, any "done" signal is
+    /// ignored — we'd rather wait for more context than pay the fixed
+    /// per-commit cost on a single-word window.
+    var minCommitSeconds: Float
+
+    /// Upper bound: when the rolling window reaches this, commit
+    /// unconditionally. Caps worst-case latency for a continuous
+    /// speaker who never pauses.
+    var maxSegmentSeconds: Float
+
+    /// Length of the trailing-silence window we check for "the speaker
+    /// just stopped." Shorter = faster commit after a phrase; longer =
+    /// fewer mid-phrase cuts.
+    var tailSilenceSeconds: Float
+
+    /// Meeting-recording defaults. Biased toward fewer, longer chunks.
+    /// `maxSegmentSeconds` was 18 s originally, but a continuous
+    /// talker could run the full window between commits and leave a
+    /// very large tail for the finalize pass on stop. 12 s is still
+    /// comfortably meeting-length but keeps the worst-case tail a
+    /// heavier model can reliably finalize inside the 30 s deadline.
+    static let meeting = CommitThresholds(
+        minCommitSeconds: 2.5,
+        maxSegmentSeconds: 12.0,
+        tailSilenceSeconds: 1.3
+    )
+
+    /// Dictation-mode. Biased toward fast paste feedback — users expect
+    /// text to appear within a second or two of finishing a phrase, not
+    /// whenever Whisper decides the sentence is "complete."
+    static let dictation = CommitThresholds(
+        minCommitSeconds: 1.2,
+        maxSegmentSeconds: 7.0,
+        tailSilenceSeconds: 0.5
+    )
+}
+
 // MARK: - Manager
 
 @MainActor
@@ -125,6 +173,13 @@ final class TranscriptionManager: ObservableObject {
     /// so the 3-circle visualizer "chases" the current mic energy.
     @Published var audioLevels: [Float] = [0, 0, 0]
 
+    /// Raw (un-boosted, un-smoothed) RMS of the last ~50 ms of audio.
+    /// Use this for silence / speech detection — `audioLevels` is the
+    /// cosmetic pre-boosted value feeding the visualizer, which is not
+    /// comparable against raw-RMS thresholds. Updated by the level loop
+    /// at ~30 Hz while recording; reset to 0 on stop/cancel.
+    @Published var currentRMS: Float = 0
+
     /// Fired IMMEDIATELY when recording stops with a speaker-less transcript
     /// plus (if speaker labeling is on) the raw audio + commits needed for
     /// a background diarization job. AppState owns the diarization worker;
@@ -144,10 +199,14 @@ final class TranscriptionManager: ObservableObject {
 
     private let sampleRate: Int = 16_000
     private let transcribeIntervalSeconds: TimeInterval = 1.5
-    private let maxSegmentSeconds: Float = 18.0
-    private let tailSilenceSeconds: Float = 1.3
     private let tailSilenceRMSThreshold: Float = 0.006
-    private let minCommitSeconds: Float = 2.5
+
+    /// Cadence for "when to flush a committed chunk to `confirmedText`."
+    /// Meeting mode uses long, infrequent chunks; dictation mode uses
+    /// short, frequent ones so paste feedback lands every ~1–2 s of
+    /// speech instead of every 4+ s. `DictationCoordinator` swaps these
+    /// on its start/stop boundaries; nothing else should mutate this.
+    var commitThresholds: CommitThresholds = .meeting
 
     // MARK: Internal
 
@@ -160,6 +219,20 @@ final class TranscriptionManager: ObservableObject {
     private var commitSampleIndex: Int = 0
     private var startedAt: Date?
     private var loadedModelId: String?
+
+    /// The currently-running (or most-recently-completed) tail-pass
+    /// finalize task. A new `stop()` schedules one; `start()` /
+    /// `loadModel()` await it to keep WhisperKit calls serialized
+    /// across session boundaries. Exposed via `pendingFinalize` for
+    /// the DictationCoordinator, which needs the tail-pass snapshot
+    /// to land before pasting and hiding its overlay (commit-once
+    /// pastes the entire transcript in one ⌘V at end of utterance).
+    private var lastFinalizeTask: Task<Void, Never>?
+
+    /// Public read-only handle on the in-flight finalize so external
+    /// callers (DictationCoordinator) can await it. Nil if nothing
+    /// has run yet, or if the last task has already finished.
+    var pendingFinalize: Task<Void, Never>? { lastFinalizeTask }
 
     private var cachedHintText: String = ""
     private var cachedPromptTokens: [Int]?
@@ -206,7 +279,12 @@ final class TranscriptionManager: ObservableObject {
         // Refuse to reload the model while audio is in flight — swapping
         // the underlying WhisperKit instance mid-recording would corrupt
         // the in-progress transcription.
-        guard !isRecording, !isFinalizing else { return }
+        guard !isRecording else { return }
+        // Wait for any in-flight tail-pass finalize to complete before
+        // swapping WhisperKit out from under it.
+        if let prior = lastFinalizeTask {
+            _ = await prior.value
+        }
         let targetModel = qualityLevel.modelId
         if modelLoaded && loadedModelId == targetModel { return }
 
@@ -248,18 +326,20 @@ final class TranscriptionManager: ObservableObject {
             return
         }
         guard !isRecording else { return }
-        // Finalize is brief (the last Whisper pass on the trailing audio).
-        // We still can't start a new recording *during* it because we'd
-        // clobber the shared audio buffer and WhisperKit instance.
-        // Diarization, however, runs entirely off the manager now — we
-        // don't block on it.
-        guard !isFinalizing else {
-            status = "Still finalizing the previous transcript…"
-            return
-        }
         guard !isLoadingModel else {
             status = "Still loading model…"
             return
+        }
+        // The previous session's tail-pass finalize may still be in
+        // flight — it runs off the manager's critical path so the UI
+        // unlocked immediately. Await it here because (a) we need to
+        // serialize WhisperKit calls so the next session's runStep
+        // doesn't race the tail transcribe, and (b) on the happy path
+        // it completes in a few hundred ms, which is invisible to the
+        // user compared to the old behavior of blocking at `stop()`.
+        if let prior = lastFinalizeTask {
+            status = "Wrapping up last session…"
+            _ = await prior.value
         }
 
         let granted = await ensureMicrophoneAccess()
@@ -306,8 +386,11 @@ final class TranscriptionManager: ObservableObject {
 
     func stop() async {
         guard isRecording else { return }
+
+        // Tear down the LIVE pipeline immediately so the UI gate
+        // (`isBusy`) flips false and the user can start a new session
+        // without waiting for the trailing Whisper pass to finish.
         isRecording = false
-        isFinalizing = true
         transcriptionTask?.cancel()
         timerTask?.cancel()
         levelTask?.cancel()
@@ -316,33 +399,36 @@ final class TranscriptionManager: ObservableObject {
         levelTask = nil
         audioProcessor?.stopRecording()
         audioLevels = [0, 0, 0]
+        currentRMS = 0
 
-        status = "Finalizing transcript…"
-        await finalizeRemaining()
+        // Capture everything the tail pass + snapshot need so it can
+        // run AFTER the manager has already reset its live state.
+        // `audioProcessor` and `whisperKit` are retained inside the
+        // captured locals but cleared (processor) / shared (kit) on
+        // `self` so the next `start()` gets a clean processor and
+        // reuses the same model.
+        let capturedKit = whisperKit
+        let capturedProcessor = audioProcessor
+        let capturedCommits = commits
+        let capturedCommitSampleIndex = commitSampleIndex
+        let capturedStartedAt = startedAt ?? Date()
+        let capturedElapsed = elapsedSeconds
+        let capturedSpeakers = speakerLabelsEnabled
+        let capturedHints = vocabularyHints
+        let capturedFilter = noiseFilterLevel
+        let capturedQuality = qualityLevel
+        let capturedCallback = onSessionCompleted
+        // Last live Whisper output that hadn't yet crossed the
+        // silence/hitMax commit threshold. Handed to the finalize path
+        // as a fallback so a timed-out or failing tail transcribe
+        // doesn't silently lose whatever Whisper already produced.
+        let capturedHypothesis = hypothesisText
 
-        // Always render the speaker-less transcript first so the view
-        // layer can show it immediately.
-        renderConfirmedText()
+        audioProcessor = nil
 
-        // Capture the ENTIRE session as a self-contained snapshot before
-        // we reset state, so that AppState can diarize later while the
-        // manager is already busy with the next recording.
-        let snapshot = TranscriptSessionSnapshot(
-            createdAt: startedAt ?? Date(),
-            durationSeconds: elapsedSeconds,
-            transcriptText: confirmedText,
-            quality: qualityLevel.rawValue,
-            noiseFilter: noiseFilterLevel.rawValue,
-            speakerLabelsEnabled: speakerLabelsEnabled,
-            vocabularyHints: vocabularyHints,
-            audioSamples: speakerLabelsEnabled
-                ? Array(audioProcessor?.audioSamples ?? [])
-                : [],
-            commits: speakerLabelsEnabled ? commits : []
-        )
-
-        // Reset the manager's in-memory state so the next recording starts
-        // clean. The snapshot is self-contained and doesn't share storage.
+        // Live-session view state resets NOW — users see an empty
+        // transcript pane while the tail pass runs. The snapshot (when
+        // it arrives) contains the complete final text.
         commits = []
         commitSampleIndex = 0
         hypothesisText = ""
@@ -351,9 +437,244 @@ final class TranscriptionManager: ObservableObject {
         elapsedSeconds = 0
         startedAt = nil
 
-        isFinalizing = false
-        status = "Transcript ready."
-        onSessionCompleted?(snapshot)
+        // Flag the tail pass as in-flight for status display and for
+        // `clear()`. NOT part of `isBusy` — the user can record a new
+        // session while this runs. The detached task below will clear
+        // the flag when it hops back to main.
+        isFinalizing = true
+        status = "Finalizing transcript…"
+
+        // Chain after any prior finalize so two back-to-back sessions
+        // don't invoke WhisperKit concurrently (its `transcribe` is
+        // not documented as reentrant-safe).
+        let prior = lastFinalizeTask
+        let task = Task.detached { [weak self] in
+            _ = await prior?.value
+            let result = await Self.runFinalizeOffMain(
+                kit: capturedKit,
+                processor: capturedProcessor,
+                startingCommits: capturedCommits,
+                commitSampleIndex: capturedCommitSampleIndex,
+                sampleRate: 16_000,
+                startedAt: capturedStartedAt,
+                elapsedSeconds: capturedElapsed,
+                speakerLabelsEnabled: capturedSpeakers,
+                vocabularyHints: capturedHints,
+                noiseFilter: capturedFilter,
+                quality: capturedQuality,
+                fallbackHypothesis: capturedHypothesis
+            )
+            await MainActor.run { [weak self] in
+                self?.isFinalizing = false
+                // Don't clobber a newer status the user may have set
+                // (e.g. they started a new recording while finalize
+                // was running — `status` already reads "Recording…").
+                // On finalize timeout/failure, surface the reason in
+                // status so the user knows why the tail may be the
+                // last live hypothesis rather than a fresh pass.
+                if self?.status == "Finalizing transcript…" {
+                    self?.status = result.warning ?? "Transcript ready."
+                }
+                capturedCallback?(result.snapshot)
+            }
+        }
+        lastFinalizeTask = task
+    }
+
+    // MARK: Off-thread finalize
+
+    /// Value returned by `runFinalizeOffMain`. `warning` is non-nil
+    /// when the tail transcribe didn't produce fresh text — either the
+    /// 30 s deadline elapsed, or WhisperKit threw — and the stop path
+    /// used the captured `hypothesisText` to keep the tail from
+    /// vanishing. The main-actor caller surfaces it on `status` so the
+    /// user sees why the last sentence may look partial.
+    fileprivate struct FinalizeResult {
+        let snapshot: TranscriptSessionSnapshot
+        let warning: String?
+    }
+
+    /// Runs the trailing Whisper pass on the captured audio and builds
+    /// the session snapshot. Pure: takes everything by value, touches
+    /// no @MainActor state. The caller (a detached Task inside
+    /// `stop()`) hops back to main after this returns to flip
+    /// `isFinalizing` and fire the onCompleted callback.
+    ///
+    /// Deadline: the tail transcribe is raced against a 30-second
+    /// sleep so a hung WhisperKit call can't strand the user forever.
+    /// The earlier 10 s cap was too tight — a long continuous utterance
+    /// could leave 10+ seconds of tail audio, which a heavier model on
+    /// modest hardware doesn't always finish in under 10 s. When the
+    /// deadline fires we fall back to `fallbackHypothesis` (the last
+    /// successful live transcribe that hadn't yet committed) so the
+    /// user doesn't lose the trailing sentence entirely.
+    ///
+    /// This function is the whole reason Stop → Start feels instant
+    /// now: it runs entirely off-main, the 230 MB audio copy for
+    /// diarization happens here (not on main during stop), and the
+    /// snapshot construction doesn't hold the main actor either.
+    nonisolated fileprivate static func runFinalizeOffMain(
+        kit: WhisperKit?,
+        processor: AudioProcessor?,
+        startingCommits: [TranscriptCommit],
+        commitSampleIndex: Int,
+        sampleRate: Int,
+        startedAt: Date,
+        elapsedSeconds: Int,
+        speakerLabelsEnabled: Bool,
+        vocabularyHints: String,
+        noiseFilter: NoiseFilterLevel,
+        quality: QualityLevel,
+        fallbackHypothesis: String
+    ) async -> FinalizeResult {
+        var finalCommits = startingCommits
+        var warning: String? = nil
+
+        // Snapshot `audioSamples` once — reads from a stopped
+        // AudioProcessor are stable. If the processor is nil
+        // (shouldn't happen on the stop path) we skip the tail pass
+        // and emit whatever commits we already have.
+        let allSamples = processor?.audioSamples ?? []
+
+        // Appends a final commit covering the range [commitSampleIndex,
+        // allSamples.count). Used both on the happy path (fresh tail
+        // transcribe) and the fallback path (captured hypothesis).
+        func appendTailCommit(_ text: String) {
+            let cleaned = sanitizeStatic(text, noiseFilter: noiseFilter)
+            guard !cleaned.isEmpty else { return }
+            let startSec = Float(commitSampleIndex) / Float(sampleRate)
+            let endSec = Float(allSamples.count) / Float(sampleRate)
+            finalCommits.append(TranscriptCommit(
+                startTime: startSec,
+                endTime: endSec,
+                text: cleaned
+            ))
+        }
+
+        if let kit,
+           allSamples.count > commitSampleIndex + sampleRate / 2 {
+
+            let window = Array(allSamples[commitSampleIndex..<allSamples.count])
+
+            // Noise-filter gate — if the tail window is silence under
+            // the current filter threshold, skip the whole transcribe.
+            var shouldTranscribe = true
+            if noiseFilter != .off {
+                let floor = noiseFilter.rmsFloor
+                if floor > 0, rmsOf(window) < floor {
+                    shouldTranscribe = false
+                }
+            }
+
+            if shouldTranscribe {
+                let options = buildDecodingOptionsOffMain(
+                    vocabularyHints: vocabularyHints,
+                    noiseFilter: noiseFilter,
+                    kit: kit
+                )
+
+                // Three possible outcomes from the raced task group:
+                // fresh Whisper text, WhisperKit throw, or 30 s
+                // deadline. Distinguishing timed-out vs. failed lets
+                // the user-facing warning be specific. `Sendable`
+                // because the value crosses task boundaries via the
+                // group's return type.
+                enum TailOutcome: Sendable {
+                    case text(String)
+                    case failed
+                    case timedOut
+                }
+
+                let outcome: TailOutcome = await withTaskGroup(of: TailOutcome.self) { group in
+                    group.addTask {
+                        do {
+                            let results = try await kit.transcribe(
+                                audioArray: window,
+                                decodeOptions: options
+                            )
+                            if let raw = results.first?.text {
+                                return .text(raw)
+                            }
+                            return .failed
+                        } catch {
+                            return .failed
+                        }
+                    }
+                    group.addTask {
+                        try? await Task.sleep(nanoseconds: 30_000_000_000)
+                        return .timedOut
+                    }
+                    let first = await group.next() ?? .failed
+                    group.cancelAll()
+                    return first
+                }
+
+                switch outcome {
+                case .text(let raw):
+                    appendTailCommit(raw)
+                case .timedOut:
+                    // Use the last live hypothesis so the trailing
+                    // utterance isn't silently dropped. Better to ship
+                    // Whisper's most recent best-effort reading of the
+                    // tail than to chop the transcript mid-sentence.
+                    appendTailCommit(fallbackHypothesis)
+                    warning = "Finalize timed out after 30 s — kept the last live partial for the tail."
+                case .failed:
+                    appendTailCommit(fallbackHypothesis)
+                    warning = "Finalize failed — kept the last live partial for the tail."
+                }
+            }
+        }
+
+        // Build the transcript text + audio copy off-main.
+        let transcriptText = renderCommitsStatic(finalCommits)
+        let audioCopy: [Float] = speakerLabelsEnabled ? Array(allSamples) : []
+
+        let snapshot = TranscriptSessionSnapshot(
+            createdAt: startedAt,
+            durationSeconds: elapsedSeconds,
+            transcriptText: transcriptText,
+            quality: quality.rawValue,
+            noiseFilter: noiseFilter.rawValue,
+            speakerLabelsEnabled: speakerLabelsEnabled,
+            vocabularyHints: vocabularyHints,
+            audioSamples: audioCopy,
+            commits: speakerLabelsEnabled ? finalCommits : []
+        )
+        return FinalizeResult(snapshot: snapshot, warning: warning)
+    }
+
+    /// Nonisolated twin of `buildDecodingOptionsStatic` — same body,
+    /// no `self` so it can be called from the detached finalize task
+    /// without hopping to main.
+    nonisolated private static func buildDecodingOptionsOffMain(
+        vocabularyHints: String,
+        noiseFilter: NoiseFilterLevel,
+        kit: WhisperKit
+    ) -> DecodingOptions {
+        let prompt = vocabularyHints.trimmingCharacters(in: .whitespacesAndNewlines)
+        var promptTokens: [Int]? = nil
+
+        if !prompt.isEmpty, let tokenizer = kit.tokenizer {
+            let prepared = " " + prompt
+            let tokens = tokenizer.encode(text: prepared)
+            let specialBegin = tokenizer.specialTokens.specialTokenBegin
+            promptTokens = tokens.filter { $0 < specialBegin }
+        }
+
+        return DecodingOptions(
+            task: .transcribe,
+            language: "en",
+            temperature: 0.0,
+            usePrefillPrompt: true,
+            skipSpecialTokens: true,
+            withoutTimestamps: false,
+            promptTokens: promptTokens,
+            suppressBlank: noiseFilter != .off,
+            compressionRatioThreshold: noiseFilter.compressionRatioThreshold,
+            logProbThreshold: noiseFilter.logProbThreshold,
+            noSpeechThreshold: noiseFilter.noSpeechThreshold
+        )
     }
 
     func clear() {
@@ -363,6 +684,39 @@ final class TranscriptionManager: ObservableObject {
         hypothesisText = ""
         commitSampleIndex = 0
         elapsedSeconds = 0
+    }
+
+    /// Abort the current recording without saving. Skips finalize, does
+    /// not emit `onSessionCompleted`, resets manager state so a new
+    /// session can start immediately. Fast path — we deliberately don't
+    /// run the trailing Whisper pass because the output is about to be
+    /// thrown away. Safe to call while `isRecording` is false (no-op).
+    ///
+    /// Used by the recorder widget's close-X button, where the user has
+    /// explicitly chosen to discard.
+    func cancel() {
+        guard isRecording else { return }
+        isRecording = false
+        transcriptionTask?.cancel()
+        timerTask?.cancel()
+        levelTask?.cancel()
+        transcriptionTask = nil
+        timerTask = nil
+        levelTask = nil
+        audioProcessor?.stopRecording()
+        audioLevels = [0, 0, 0]
+        currentRMS = 0
+
+        // Drop everything. No snapshot, no callback — the session
+        // ceases to exist as far as the rest of the app is concerned.
+        commits = []
+        commitSampleIndex = 0
+        hypothesisText = ""
+        confirmedText = ""
+        currentLine = ""
+        elapsedSeconds = 0
+        startedAt = nil
+        status = "Recording discarded."
     }
 
     // MARK: Transcription loop
@@ -404,6 +758,11 @@ final class TranscriptionManager: ObservableObject {
                         var sumSq: Float = 0
                         for x in tail { sumSq += x * x }
                         let rms = (sumSq / Float(tail.count)).squareRoot()
+                        // Expose the raw value so callers (e.g. the
+                        // dictation silence monitor) can reason about
+                        // speech/silence against real mic levels rather
+                        // than the boosted visualizer ones.
+                        self.currentRMS = rms
                         // Speech RMS is typically ~0.01–0.15; boost to 0…1 range.
                         let normalized = min(1.1, rms * 14)
                         var updated = self.audioLevels
@@ -459,8 +818,8 @@ final class TranscriptionManager: ObservableObject {
             updateCurrentLine()
 
             let tailSilent = detectTailSilence(samples: window)
-            let longEnough = windowDuration >= minCommitSeconds
-            let hitMax = windowDuration >= maxSegmentSeconds
+            let longEnough = windowDuration >= commitThresholds.minCommitSeconds
+            let hitMax = windowDuration >= commitThresholds.maxSegmentSeconds
 
             if !text.isEmpty && ((tailSilent && longEnough) || hitMax) {
                 appendCommit(text: text, endingSampleIndex: allSamples.count)
@@ -624,17 +983,79 @@ final class TranscriptionManager: ObservableObject {
     }
 
     private func detectTailSilence(samples: [Float]) -> Bool {
-        let tailCount = Int(Float(sampleRate) * tailSilenceSeconds)
+        let tailCount = Int(Float(sampleRate) * commitThresholds.tailSilenceSeconds)
         guard samples.count >= tailCount + sampleRate else { return false }
         let tail = samples.suffix(tailCount)
         return rms(of: Array(tail)) < tailSilenceRMSThreshold
     }
 
     private func rms(of samples: [Float]) -> Float {
+        Self.rmsOf(samples)
+    }
+
+    /// Static RMS used by the off-thread finalize path. Same math as
+    /// `rms(of:)` but callable without a main-actor hop.
+    fileprivate nonisolated static func rmsOf(_ samples: [Float]) -> Float {
         guard !samples.isEmpty else { return 0 }
         var sumSq: Float = 0
         for x in samples { sumSq += x * x }
         return (sumSq / Float(samples.count)).squareRoot()
+    }
+
+    /// Static sanitizer used by the off-thread finalize path.
+    /// Mirrors `sanitize(_:)` exactly — filter-off returns the raw
+    /// trimmed input, filter-on drops known Whisper silence
+    /// hallucinations.
+    fileprivate nonisolated static func sanitizeStatic(
+        _ raw: String?,
+        noiseFilter: NoiseFilterLevel
+    ) -> String {
+        let t = (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if t.isEmpty { return "" }
+        if noiseFilter == .off { return t }
+        let lower = t.lowercased()
+        let bannedExact: Set<String> = [
+            "thanks for watching.",
+            "thanks for watching!",
+            "thank you for watching.",
+            "thank you for watching!",
+            "thank you.",
+            "thanks.",
+            "please subscribe.",
+            "subtitles by the amara.org community",
+            "you",
+            ".",
+            "♪",
+            "[music]",
+            "[silence]",
+            "(music)",
+            "(silence)"
+        ]
+        if bannedExact.contains(lower) { return "" }
+        return t
+    }
+
+    /// Static version of the transcript renderer used by the finalize
+    /// task. Identical output to `renderConfirmedText`'s — speaker
+    /// prefix per block when labels exist, plain text otherwise.
+    fileprivate nonisolated static func renderCommitsStatic(_ commits: [TranscriptCommit]) -> String {
+        if commits.isEmpty { return "" }
+        var out = ""
+        var currentLabel: String? = "__none__"
+        for c in commits {
+            if c.speakerLabel != currentLabel {
+                if !out.isEmpty { out += "\n\n" }
+                if let label = c.speakerLabel {
+                    out += "\(label): \(c.text)"
+                } else {
+                    out += c.text
+                }
+                currentLabel = c.speakerLabel
+            } else {
+                out += " " + c.text
+            }
+        }
+        return out
     }
 
     /// Strips Whisper's well-known silence hallucinations (only when a filter
@@ -685,12 +1106,15 @@ final class TranscriptionManager: ObservableObject {
     }
 
     /// True whenever something blocks the user from starting a new
-    /// recording right now. Note: diarization is deliberately excluded —
-    /// it runs on a self-contained snapshot in AppState and doesn't touch
-    /// the manager. Live recording, finalize, and model loading *do* need
-    /// exclusive access to the pipeline.
+    /// recording right now. Deliberately excludes:
+    ///   • diarization — runs on a self-contained snapshot in AppState
+    ///     and doesn't touch the manager.
+    ///   • finalize (the tail Whisper pass after Stop) — now runs on a
+    ///     detached Task off the manager's critical path. The next
+    ///     `start()` awaits it internally, so the UI doesn't need to.
+    /// Only live recording and model loading actually block the pipeline.
     var isBusy: Bool {
-        isRecording || isFinalizing || isLoadingModel
+        isRecording || isLoadingModel
     }
 
     /// True if the currently-selected quality doesn't match the model we
@@ -701,9 +1125,11 @@ final class TranscriptionManager: ObservableObject {
     }
 
     /// A short label explaining *why* we're busy. Nil when we're free.
+    /// Intentionally doesn't mention finalize — finalize runs off the
+    /// critical path and doesn't flip `isBusy`, so any caller reading
+    /// `busyReason` is asking about the live pipeline specifically.
     var busyReason: String? {
         if isRecording    { return "Recording…" }
-        if isFinalizing   { return "Finalizing transcript…" }
         if isLoadingModel { return "Loading model…" }
         return nil
     }

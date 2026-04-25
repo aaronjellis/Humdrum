@@ -135,6 +135,25 @@ final class SessionStore: ObservableObject {
         sessions.removeAll { $0.id == session.id }
     }
 
+    /// Update a session's user-facing title and persist. Trims whitespace;
+    /// an empty result reverts to the auto-generated title so users never
+    /// end up with a blank row. Idempotent if the title is unchanged.
+    ///
+    /// Kept separate from raw `save(_:)` so rename-specific UX rules
+    /// (trimming, empty-string fallback) live in one place — every
+    /// rename entrypoint (sidebar double-click, detail-view title,
+    /// context menu) routes through this.
+    func rename(_ session: TranscriptSession, to newTitle: String) {
+        let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolved = trimmed.isEmpty
+            ? TranscriptSession.autoTitle(from: session.transcriptText, fallback: session.createdAt)
+            : trimmed
+        guard resolved != session.title else { return }
+        var updated = session
+        updated.title = resolved
+        save(updated)
+    }
+
     func session(with id: UUID) -> TranscriptSession? {
         sessions.first(where: { $0.id == id })
     }

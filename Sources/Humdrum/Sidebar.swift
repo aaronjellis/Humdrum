@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import HumdrumCore
 
 struct Sidebar: View {
     @EnvironmentObject var store: SessionStore
@@ -10,10 +11,13 @@ struct Sidebar: View {
 
     let recordingInProgress: Bool
 
+    @State private var searchQuery: String = ""
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             brand
             startRecordingButton
+            searchField
             listHeader
             sessionList
             Spacer(minLength: 0)
@@ -21,6 +25,89 @@ struct Sidebar: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .background(AppTheme.sidebar)
+    }
+
+    // MARK: Search
+    //
+    // Simple case-insensitive substring match across title + transcript
+    // text. Kept local to the sidebar — the query doesn't need to persist
+    // across launches, and filtering in-memory is fine at the scale of
+    // sessions a single user accumulates. If session count ever grows
+    // into the thousands we'd want indexed search, but that's a problem
+    // for future-us.
+    private var searchField: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 11))
+                .foregroundStyle(AppTheme.textTertiary)
+            TextField("Search sessions", text: $searchQuery)
+                .textFieldStyle(.plain)
+                .font(.system(size: 12))
+                .foregroundStyle(AppTheme.textPrimary)
+            if !searchQuery.isEmpty {
+                Button { searchQuery = "" } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 11))
+                        .foregroundStyle(AppTheme.textTertiary)
+                }
+                .buttonStyle(.plain)
+                .help("Clear search")
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .fill(Color.white.opacity(0.035))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .stroke(AppTheme.border, lineWidth: 0.5)
+        )
+        .padding(.horizontal, 14)
+        .padding(.bottom, 12)
+    }
+
+    private var filteredSessions: [TranscriptSession] {
+        let q = searchQuery
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard !q.isEmpty else { return store.sessions }
+
+        // Score each session and rank by relevance. Title matches use
+        // the full fuzzy matcher (typos, subsequences, word boundaries);
+        // transcript matches are plain substring only — fuzzy across a
+        // multi-thousand-word transcript is both expensive and noisy.
+        // Title score is weighted 3× so "budget" always surfaces a
+        // session titled "Budget review" above one that merely mentions
+        // the word somewhere deep in the body.
+        struct Hit { let session: TranscriptSession; let score: Int }
+        var hits: [Hit] = []
+        for session in store.sessions {
+            let titleScore = FuzzyMatcher.score(
+                query: q,
+                in: session.displayTitle.lowercased()
+            )
+            let transcriptMatch = session.transcriptText
+                .range(of: q, options: .caseInsensitive) != nil
+
+            if let ts = titleScore {
+                hits.append(Hit(session: session, score: ts * 3))
+            } else if transcriptMatch {
+                hits.append(Hit(session: session, score: 50))
+            }
+        }
+        return hits
+            .sorted {
+                $0.score != $1.score
+                    ? $0.score > $1.score
+                    : $0.session.createdAt > $1.session.createdAt
+            }
+            .map(\.session)
+    }
+
+    private var isSearching: Bool {
+        !searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     // MARK: Brand block
@@ -145,12 +232,23 @@ struct Sidebar: View {
                         .padding(.horizontal, 18)
                         .padding(.vertical, 8)
                         .fixedSize(horizontal: false, vertical: true)
+                } else if filteredSessions.isEmpty && isSearching {
+                    Text("No sessions match “\(searchQuery)”.")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(AppTheme.textTertiary)
+                        .multilineTextAlignment(.leading)
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 8)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                ForEach(store.sessions) { session in
+                ForEach(filteredSessions) { session in
                     SessionRow(
                         session: session,
                         isSelected: appState.selection == .session(session.id),
                         onSelect: { appState.selection = .session(session.id) },
+                        onRename: { newTitle in
+                            store.rename(session, to: newTitle)
+                        },
                         onDelete: {
                             let wasSelected = appState.selection == .session(session.id)
                             store.delete(session)
@@ -212,12 +310,21 @@ private struct SessionRow: View {
     let session: TranscriptSession
     let isSelected: Bool
     let onSelect: () -> Void
+    let onRename: (String) -> Void
     let onDelete: () -> Void
 
     @State private var isHovering = false
+    @State private var isEditing = false
+    @State private var draftTitle = ""
+    @FocusState private var editingFocused: Bool
 
     var body: some View {
-        Button(action: onSelect) {
+        Button(action: {
+            // When editing, the TextField owns clicks — don't let the
+            // enclosing Button hijack focus and kick the user out of
+            // rename mid-keystroke.
+            if !isEditing { onSelect() }
+        }) {
             HStack(spacing: 0) {
                 // Emerald left-edge on the active row
                 Rectangle()
@@ -226,11 +333,29 @@ private struct SessionRow: View {
                     .cornerRadius(1)
 
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(session.displayTitle)
-                        .font(.system(size: 12.5, weight: isSelected ? .semibold : .medium))
-                        .foregroundStyle(AppTheme.textPrimary)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
+                    if isEditing {
+                        TextField("Name", text: $draftTitle)
+                            .textFieldStyle(.plain)
+                            .font(.system(size: 12.5, weight: .semibold))
+                            .foregroundStyle(AppTheme.textPrimary)
+                            .focused($editingFocused)
+                            .onSubmit(commitRename)
+                            .onExitCommand(perform: cancelRename)
+                            // Commit on focus loss too (click elsewhere
+                            // without pressing Return) — matches Finder's
+                            // rename behavior. onSubmit + cancel both
+                            // already flip isEditing, so this branch
+                            // only runs when focus is lost passively.
+                            .onChange(of: editingFocused) { _, focused in
+                                if !focused && isEditing { commitRename() }
+                            }
+                    } else {
+                        Text(session.displayTitle)
+                            .font(.system(size: 12.5, weight: isSelected ? .semibold : .medium))
+                            .foregroundStyle(AppTheme.textPrimary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
 
                     Text(metadataLine)
                         .font(.system(size: 10.5))
@@ -258,8 +383,32 @@ private struct SessionRow: View {
         .buttonStyle(.plain)
         .onHover { isHovering = $0 }
         .contextMenu {
+            Button("Rename", action: beginRename)
             Button("Delete Session", role: .destructive, action: onDelete)
         }
+    }
+
+    // MARK: Rename lifecycle
+    //
+    // Enter on a context-menu "Rename" or a programmatic call. We seed
+    // the TextField with the stored title (not displayTitle) so auto-
+    // generated-from-transcript titles appear as placeholder-ish text
+    // the user can overwrite in one keystroke.
+    private func beginRename() {
+        draftTitle = session.title
+        isEditing = true
+        // Focus has to be set after the TextField exists — a one-tick
+        // delay is enough for SwiftUI to materialize it.
+        DispatchQueue.main.async { editingFocused = true }
+    }
+
+    private func commitRename() {
+        onRename(draftTitle)
+        isEditing = false
+    }
+
+    private func cancelRename() {
+        isEditing = false
     }
 
     private var metadataLine: String {

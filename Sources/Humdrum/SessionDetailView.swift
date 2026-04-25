@@ -15,6 +15,9 @@ struct SessionDetailView: View {
     let session: TranscriptSession
 
     @State private var showCopyConfirmation: Bool = false
+    @State private var isEditingTitle: Bool = false
+    @State private var draftTitle: String = ""
+    @FocusState private var titleFocused: Bool
 
     /// True if the background diarization worker is still processing this
     /// specific session. Independent of the manager — the user can be
@@ -43,10 +46,29 @@ struct SessionDetailView: View {
 
     private var header: some View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
-            Text(session.displayTitle)
-                .font(.system(size: 16, weight: .semibold))
-                .foregroundStyle(AppTheme.textPrimary)
-                .lineLimit(2)
+            if isEditingTitle {
+                TextField("Name", text: $draftTitle)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(AppTheme.textPrimary)
+                    .focused($titleFocused)
+                    .onSubmit(commitTitleRename)
+                    .onExitCommand(perform: cancelTitleRename)
+                    .onChange(of: titleFocused) { _, focused in
+                        if !focused && isEditingTitle { commitTitleRename() }
+                    }
+            } else {
+                Text(session.displayTitle)
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(AppTheme.textPrimary)
+                    .lineLimit(2)
+                    .contentShape(Rectangle())
+                    .onTapGesture(count: 2, perform: beginTitleRename)
+                    .contextMenu {
+                        Button("Rename", action: beginTitleRename)
+                    }
+                    .help("Double-click to rename")
+            }
 
             if isDiarizingThisSession {
                 diarizingBadge
@@ -59,6 +81,23 @@ struct SessionDetailView: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 14)
+    }
+
+    // MARK: Title rename
+
+    private func beginTitleRename() {
+        draftTitle = session.title
+        isEditingTitle = true
+        DispatchQueue.main.async { titleFocused = true }
+    }
+
+    private func commitTitleRename() {
+        store.rename(session, to: draftTitle)
+        isEditingTitle = false
+    }
+
+    private func cancelTitleRename() {
+        isEditingTitle = false
     }
 
     private var diarizingBadge: some View {

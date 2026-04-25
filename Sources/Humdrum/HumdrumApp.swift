@@ -80,6 +80,18 @@ struct HumdrumApp: App {
                 manager.onModelLoaded = { [weak modelCache] in
                     modelCache?.refresh()
                 }
+                // Pre-warm the Whisper model on launch IF we already
+                // have it on disk. This turns the first ⌥Space into an
+                // instant paste instead of a 2–4 s model-load hang. We
+                // deliberately do NOT trigger a download here — that'd
+                // surprise the user with a silent ~150 MB–1.5 GB fetch
+                // on every fresh install. The Setup window / onboarding
+                // is the right place for the first download.
+                if onboarding.isOnboarded,
+                   modelCache.isCached(manager.qualityLevel),
+                   manager.needsReload {
+                    await manager.loadModel()
+                }
             }
         }
         .windowResizability(.contentMinSize)
