@@ -123,29 +123,37 @@ struct DictationOverlayView: View {
     var body: some View {
         VStack(spacing: 8) {
             // Single TimelineView drives every continuous animation:
-            // the chunk-pulse confirmation flash, the silence-countdown
-            // ring, and the post-timeout wind-down scale on the orb
-            // itself. One timeline source means everything is rendered
-            // from the same `now`, so the ring drain, the wind-down
-            // scale, and the auto-stop fire stay perfectly aligned.
+            // the orb's breathing/aberration motion, the chunk-pulse
+            // confirmation flash, the silence-countdown ring, and the
+            // post-paste wind-down scale. One timeline source means
+            // everything is rendered from the same `now`, so phases
+            // stay perfectly aligned with the engine's silence
+            // monitor (which uses the same `lastSpeechTime` anchor).
             //
-            // Wind-down model (two-phase silence visual):
+            // Wind-down model:
             //   Phase 1 — `[0, T]`: full-size orb, ring drains.
-            //             T = `silenceTimeoutSeconds`.
-            //   Phase 2 — `[T, 2T]`: ring is gone, orb scales 1.0 → 0
-            //             over another T. Mic is still hot — speaking
-            //             snaps the orb back to full and resets the
-            //             phase-1 ring. At elapsed = 2T the silence
-            //             monitor fires `stop()` and the orb hides.
+            //             T = `silenceTimeoutSeconds`. At elapsed = T
+            //             the silence monitor fires `stop()` →
+            //             snapshot finalize → ⌘V paste lands.
+            //   Phase 2 — `[T, 2T]`: post-paste wind-down. The orb
+            //             scales 1.0 → 0 across `stop()`'s linger
+            //             window. The engine is already stopped and
+            //             the text is in the focused field; this is
+            //             a courtesy fade only.
             //
-            // This split exists because users wanted the configured
-            // timeout to mean "you have this long of full-size orb to
-            // think before I start packing up" rather than "I start
-            // packing up the moment you take a breath." See
-            // `DictationCoordinator.evaluateAudio` for the matching
-            // 2× threshold.
+            // The user-facing meaning of `silenceTimeoutSeconds` is
+            // "how long of silence triggers the paste" — paste
+            // happens at T, not 2T. The phase-2 visual is purely
+            // cosmetic teardown. (Earlier iterations let users speak
+            // during phase 2 to reactivate; that affordance was
+            // removed when we moved paste to end-of-phase-1, since
+            // the text has already been delivered by the time phase 2
+            // starts and continuing would require another paste.)
             TimelineView(.animation(minimumInterval: 1.0 / 60.0)) { timeline in
                 let scale = windDownScale(now: timeline.date)
+                let breath = breathingScale(now: timeline.date)
+                let drift = aberrationOffset(now: timeline.date)
+                let tilt = aberrationRotation(now: timeline.date)
                 ZStack {
                     AudioVisualizer(
                         levels: manager.audioLevels,
@@ -158,16 +166,29 @@ struct DictationOverlayView: View {
                     // word-ticker experiment (the ticker visibly
                     // squashed inside the orb and stutter-paused
                     // because Whisper commits don't tick on every
-                    // word). The label is always-on while the orb is
-                    // up, which is the constant feedback users wanted:
-                    // they don't have to wonder whether the mic is
-                    // hot.
-                    ListeningIndicator(orbDiameter: orbSize)
+                    // word). The label is gated on detected speech:
+                    // visible while the user is talking, fades out
+                    // within ~300ms once they stop. The orb's own
+                    // breathing/aberration motion (below) is the
+                    // always-on "I'm running" signal.
+                    ListeningIndicator(
+                        orbDiameter: orbSize,
+                        dictation: dictation,
+                        now: timeline.date
+                    )
 
                     indicators(now: timeline.date)
                         .frame(width: orbSize, height: orbSize)
                         .allowsHitTesting(false)
                 }
+                // Order matters: aberration transforms first (in the
+                // orb's local space), then the wind-down scale, then
+                // opacity. That way the breathing/drift motion shrinks
+                // with the orb during phase 2 instead of bouncing
+                // around its old origin.
+                .rotationEffect(tilt)
+                .offset(drift)
+                .scaleEffect(breath)
                 .scaleEffect(scale)
                 .opacity(Double(scale))
             }
@@ -197,15 +218,54 @@ struct DictationOverlayView: View {
         }
     }
 
+    /// Always-on breathing scale — a slow primary inhale/exhale plus
+    /// a faster, smaller secondary wave with a phase offset. The two
+    /// waves never align cleanly (irrational period ratio), so the
+    /// orb never quite repeats itself: the eye reads it as organic
+    /// "alive" motion rather than a metronomic pulse. Amplitudes are
+    /// kept under ~3% combined so the breathing reads as personality
+    /// without competing with AudioVisualizer's louder peak response.
+    private func breathingScale(now: Date) -> CGFloat {
+        let t = now.timeIntervalSinceReferenceDate
+        let primary = sin(t * 2 * .pi / 3.5) * 0.020
+        let secondary = cos(t * 2 * .pi / 1.7 + 0.7) * 0.008
+        return CGFloat(1.0 + primary + secondary)
+    }
+
+    /// A barely-perceptible 2D drift, applied as a translation on the
+    /// orb stack. Two independent slow waves on x and y so the orb
+    /// traces a Lissajous-ish path rather than oscillating along an
+    /// axis. ±1.2 pt is small enough not to look like jitter, large
+    /// enough to register peripherally as "this thing is alive."
+    private func aberrationOffset(now: Date) -> CGSize {
+        let t = now.timeIntervalSinceReferenceDate
+        let x = sin(t * 2 * .pi / 4.3) * 1.2
+        let y = cos(t * 2 * .pi / 5.7 + 1.3) * 1.0
+        return CGSize(width: x, height: y)
+    }
+
+    /// Subtle rotational tilt — ±0.6° at a long period. Pairs with
+    /// the offset above to give the orb a feeling of suspension in
+    /// space rather than rigid attachment to the panel. The angle
+    /// stays small enough that the AudioVisualizer's internal
+    /// asymmetric specular highlight doesn't read as wobbling badly.
+    private func aberrationRotation(now: Date) -> Angle {
+        let t = now.timeIntervalSinceReferenceDate
+        return .degrees(sin(t * 2 * .pi / 6.1) * 0.6)
+    }
+
     /// Phase-2 (wind-down) orb scale. See `body` for the model:
     /// returns 1.0 throughout phase 1 and the no-speech-yet window,
     /// then linearly shrinks 1.0 → 0 across phase 2 once the
     /// configured silence timeout has elapsed since last speech.
     ///
-    /// The `lastSpeechTime` anchor is shared with the silence monitor;
-    /// when the user speaks during phase 2 the anchor jumps forward,
-    /// elapsed snaps back below T, and this function returns 1.0 on
-    /// the next frame — the orb appears to spring back to full size.
+    /// Under the commit-at-phase-1 cadence (post-paste-pivot v2), this
+    /// scale animates during `stop()`'s linger after the paste has
+    /// already landed — the engine is stopped, `lastSpeechTime` is
+    /// frozen, and elapsed naturally crosses into the phase 2 window.
+    /// The "speak again to reactivate" affordance from the previous
+    /// design is intentionally gone: by the time the user could speak
+    /// again the paste is already in their focused field.
     private func windDownScale(now: Date) -> CGFloat {
         // Pre-speech window: hold full size; the no-speech timeout
         // fires its own teardown without a visual wind-down.
@@ -388,21 +448,40 @@ struct StatusPill: View {
 
 /// Small "Listening" label with three trailing dots that pulse in
 /// sequence, rendered inside the dictation orb. Pure visual feedback
-/// that audio capture is live — the orb's halo already reacts to mic
-/// peaks, but on quieter speech (or while the user is still gathering
-/// their thoughts) the visualizer can read as inert. The dots give a
-/// constant heartbeat so there's no "is it on?" ambiguity.
+/// that audio capture is hearing you specifically — distinct from the
+/// orb's own breathing/aberration motion, which is the always-on
+/// "engine is running" signal.
 ///
-/// The label is purely visual — `allowsHitTesting(false)` keeps it out
-/// of the cursor path so the underlying app still gets pointer events.
+/// Visibility is gated on `dictation.lastSpeechTime`: the indicator
+/// fades in within one render frame of speech being detected and
+/// fades out within ~300 ms of silence resuming. This prevents the
+/// label from sitting frozen on screen during long thinking pauses
+/// (which read as "is the app stuck?") and matches what the user
+/// asked for: the dots should pop up only when there's actually
+/// noise.
+///
+/// The label is purely visual — `allowsHitTesting(false)` keeps it
+/// out of the cursor path so the underlying app still gets pointer
+/// events.
 private struct ListeningIndicator: View {
     /// Orb render diameter. Font size scales as a fraction so the
     /// label looks balanced if the orb's size is ever tuned.
     let orbDiameter: CGFloat
 
-    /// Per-dot opacity peaks at the same point on each cycle, just
-    /// staggered. 1.2s feels like a natural breathing cadence — fast
-    /// enough to read as alive, slow enough not to feel jittery.
+    /// The dictation coordinator, observed for `lastSpeechTime`
+    /// updates. The parent's TimelineView already drives the redraws
+    /// — we don't need a local TimelineView here since `now` is
+    /// passed in.
+    @ObservedObject var dictation: DictationCoordinator
+
+    /// Current frame time, supplied by the parent's TimelineView so
+    /// the recency check stays in lock-step with the wind-down scale
+    /// and ring-countdown animations.
+    let now: Date
+
+    /// Per-dot pulse cadence. 1.2 s feels like a natural breathing
+    /// rhythm — fast enough to read as alive, slow enough not to
+    /// feel jittery.
     private let cycleSeconds: Double = 1.2
 
     /// Lag between successive dots, as a fraction of the cycle. At
@@ -410,30 +489,55 @@ private struct ListeningIndicator: View {
     /// first without piling up on top of each other.
     private let dotLag: Double = 0.18
 
+    /// How long we hold full opacity after the last detected speech
+    /// before starting the fade-out. Roughly matches the silence
+    /// monitor's 200 ms tick so a single missed RMS sample doesn't
+    /// drop the dots mid-utterance.
+    private let holdSeconds: Double = 0.2
+
+    /// Fade-out duration once `holdSeconds` has elapsed. 300 ms total
+    /// (hold + fade ≈ 0.5 s) reads as "snaps off as soon as you
+    /// stop talking" without strobing on natural inter-syllable
+    /// silences.
+    private let fadeSeconds: Double = 0.3
+
     private var fontSize: CGFloat { max(11, orbDiameter * 0.085) }
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { ctx in
-            HStack(alignment: .center, spacing: 1) {
-                Text("Listening")
-                    .foregroundStyle(.white.opacity(0.85))
-                ForEach(0..<3, id: \.self) { i in
-                    Text(".")
-                        .foregroundStyle(.white.opacity(dotOpacity(i, at: ctx.date)))
-                }
+        let visibility = speechVisibility()
+        HStack(alignment: .center, spacing: 1) {
+            Text("Listening")
+                .foregroundStyle(.white.opacity(0.85))
+            ForEach(0..<3, id: \.self) { i in
+                Text(".")
+                    .foregroundStyle(.white.opacity(dotOpacity(i)))
             }
-            .font(.system(size: fontSize, weight: .medium, design: .rounded))
-            .shadow(color: .black.opacity(0.35), radius: 2, y: 0)
         }
+        .font(.system(size: fontSize, weight: .medium, design: .rounded))
+        .shadow(color: .black.opacity(0.35), radius: 2, y: 0)
+        .opacity(visibility)
         .frame(width: orbDiameter, height: orbDiameter)
         .allowsHitTesting(false)
+    }
+
+    /// 1.0 while speech is fresh, linearly fading to 0 across
+    /// `fadeSeconds` once the recency exceeds `holdSeconds`. Returns
+    /// 0 if the user hasn't spoken yet — the orb's breathing motion
+    /// already signals "I'm here," no need for the dots to crowd
+    /// the no-speech window.
+    private func speechVisibility() -> Double {
+        guard let last = dictation.lastSpeechTime else { return 0 }
+        let recency = now.timeIntervalSince(last)
+        if recency <= holdSeconds { return 1.0 }
+        let progress = (recency - holdSeconds) / fadeSeconds
+        return max(0.0, 1.0 - progress)
     }
 
     /// Sine-wave opacity for a given dot. Phase = cycle position
     /// shifted by `dotLag * i`. Output mapped to [0.2, 1.0] so dots
     /// never fully disappear (a flickered-out dot reads as a layout
     /// bug, not an animation).
-    private func dotOpacity(_ index: Int, at now: Date) -> Double {
+    private func dotOpacity(_ index: Int) -> Double {
         let secs = now.timeIntervalSinceReferenceDate
         let phase = (secs / cycleSeconds - Double(index) * dotLag) * 2.0 * .pi
         let normalized = (sin(phase) + 1.0) / 2.0          // 0..1

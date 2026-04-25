@@ -9,12 +9,18 @@ import HumdrumCore
 /// Orchestrates Whisper Flow-style dictation, commit-once.
 ///
 ///   Press ⌥Space → orb appears centered on screen → speak → after
-///   `silenceTimeoutSeconds` of silence the countdown ring drains;
-///   after another `silenceTimeoutSeconds` of continued silence the
-///   orb scales down to zero and dictation auto-stops. (Speaking at
-///   any point during either phase resets the timer.) On stop, we
-///   wait for the tail Whisper pass to finalize, then paste the
-///   entire transcript into the focused field as a single ⌘V.
+///   `silenceTimeoutSeconds` of silence the countdown ring drains and
+///   we immediately stop, finalize, and paste the entire transcript
+///   into the focused field as a single ⌘V. The orb then visually
+///   winds down (scales 1.0 → 0 over another `silenceTimeoutSeconds`)
+///   purely as a courtesy fade — the engine is already stopped and
+///   the paste has already landed by then. Speaking during the
+///   countdown resets the timer; speaking during the post-paste fade
+///   does not — at that point you'd press ⌥Space to start a new
+///   dictation. The user's complaint that drove this design was "the
+///   text appears too late": commit-at-phase-1-end means the user
+///   sees their text the moment the ring drains, not silenceTimeout
+///   seconds later.
 ///
 /// Text goes in via clipboard + ⌘V. See `PasteHelper` for the
 /// rationale (short version: ⌘V is the OS-blessed insertion event
@@ -59,12 +65,20 @@ final class DictationCoordinator: ObservableObject {
     /// results) the post-paste AX verification runs.
     @Published private(set) var pasteOutcome: PasteOutcome = .succeeded
 
-    /// Timestamp of the most recent detected speech. The overlay
-    /// reads this twice: the silence-countdown ring drains over
-    /// `silenceTimeoutSeconds` (phase 1), then the orb scales 1.0 →
-    /// 0 over another `silenceTimeoutSeconds` (phase 2). When the
-    /// elapsed time reaches `silenceTimeoutSeconds * 2` the silence
-    /// monitor fires `stop()`.
+    /// Timestamp of the most recent detected speech. Drives several
+    /// things in the overlay:
+    ///   • The silence-countdown ring drains over `silenceTimeoutSeconds`
+    ///     (phase 1). When elapsed reaches `silenceTimeoutSeconds`
+    ///     the silence monitor fires `stop()` — that's when paste
+    ///     lands.
+    ///   • The post-paste wind-down (phase 2) keeps using this anchor
+    ///     to drive the orb's 1.0 → 0 scale: by the time stop()'s
+    ///     linger is running, `lastSpeechTime` is frozen and elapsed
+    ///     keeps growing past `silenceTimeoutSeconds`, so the
+    ///     scale function naturally animates the fade.
+    ///   • The Listening… indicator inside the orb checks freshness
+    ///     against this anchor — fades in fast when it's recent,
+    ///     fades out within ~400ms once silence resumes.
     @Published private(set) var lastSpeechTime: Date?
 
     /// Timestamp of the current dictation session's start. Exposed so
@@ -417,7 +431,6 @@ final class DictationCoordinator: ObservableObject {
     private func stop(reason: StopReason) async {
         guard isDictating else { return }
         isDictating = false
-        _ = reason  // not used today; retained on the signature for telemetry hooks
 
         silenceTask?.cancel()
         silenceTask = nil
@@ -531,13 +544,29 @@ final class DictationCoordinator: ObservableObject {
         manager.vocabularyHints = savedVocabHints
         manager.commitThresholds = savedCommitThresholds
 
-        // Outcome-dependent orb linger. On success, we want enough
-        // time for ⌘V to paint in the target app and the user to
-        // register the ring-pulse confirmation — but not so long
-        // that the orb feels sticky. On failure, the orb needs to
-        // hold long enough that the failure pill is readable and
-        // actionable.
-        let lingerNs: UInt64 = (pasteOutcome == .succeeded) ? 250_000_000 : 4_500_000_000
+        // Outcome- and reason-dependent orb linger.
+        //
+        //   • Silence-timeout success: hold the orb up for one
+        //     `silenceTimeoutSeconds`. `lastSpeechTime` is frozen at
+        //     this point, so the overlay's `windDownScale` naturally
+        //     animates the orb 1.0 → 0 across the linger window —
+        //     this is the post-paste phase 2 wind-down visual.
+        //   • Hotkey or no-speech success: 250 ms — the user explicitly
+        //     stopped (or never started talking), so a long fade reads
+        //     as sticky.
+        //   • Any failure: 4.5 s so the failure pill is readable and
+        //     actionable before the orb disappears.
+        let lingerNs: UInt64
+        if pasteOutcome == .succeeded {
+            switch reason {
+            case .silenceTimeout:
+                lingerNs = UInt64(silenceTimeoutSeconds * 1_000_000_000)
+            case .hotkey, .noSpeechTimeout:
+                lingerNs = 250_000_000
+            }
+        } else {
+            lingerNs = 4_500_000_000
+        }
         try? await Task.sleep(nanoseconds: lingerNs)
 
         overlay.hide()
@@ -604,16 +633,18 @@ final class DictationCoordinator: ObservableObject {
         }
 
         // Had speech already — check the "stopped talking" timeout.
-        // Auto-stop fires at 2 × `silenceTimeoutSeconds`. The first
-        // window is the user-facing "you have this long to think before
-        // I start packing up" phase the countdown ring drains over;
-        // the second is the visual wind-down where the orb scales 1.0
-        // → 0 (see `DictationOverlayView.windDownScale`). Speaking at
-        // any point during either phase advances `lastSpeechTime`,
-        // resetting the elapsed back to zero — exactly the
-        // "speak again to reactivate" affordance the user asked for.
+        // Auto-stop fires at exactly `silenceTimeoutSeconds` so the
+        // paste lands the moment the countdown ring drains. The
+        // post-paste wind-down (orb scaling 1.0 → 0 — see
+        // `DictationOverlayView.windDownScale`) plays out during
+        // `stop()`'s linger, but by then the engine is already
+        // stopped and the text is already in the focused field.
+        // Speaking during phase 1 advances `lastSpeechTime`, resetting
+        // the elapsed back to zero. Speaking during the post-paste
+        // fade does NOT reactivate dictation — at that point the user
+        // taps ⌥Space again to start a fresh capture.
         if let last = lastSpeechTime,
-           Date().timeIntervalSince(last) >= silenceTimeoutSeconds * 2 {
+           Date().timeIntervalSince(last) >= silenceTimeoutSeconds {
             Task { await self.stop(reason: .silenceTimeout) }
         }
     }
