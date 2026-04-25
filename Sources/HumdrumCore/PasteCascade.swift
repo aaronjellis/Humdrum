@@ -1,15 +1,51 @@
 import Foundation
 
-/// Outcome of a paste attempt, surfaced to the dictation coordinator.
-/// `.inserted` means one of the cascade stages reported it succeeded
-/// (clipboard+⌘V or keystroke synthesis). `.failed` means every stage
-/// either short-circuited (empty text, no Accessibility, password
-/// field refusal) or fell through — the coordinator uses this to
-/// avoid advancing `pastedText`, so the chunk can be retried in the
-/// next tick.
+/// Outcome of a paste attempt, as reported by the cascade itself.
+/// `.inserted` means one of the cascade stages ran to completion
+/// (clipboard + ⌘V or keystroke synthesis). `.failed` means every
+/// stage either short-circuited (empty text, no Accessibility,
+/// password field refusal) or fell through.
+///
+/// Note that `.inserted` is the cascade's *self-report*: it posted a
+/// ⌘V (or unicode keystrokes) and the OS accepted them. Whether the
+/// receiving app actually consumed those events into its text buffer
+/// is a separate question — Electron renderers and some hardened web
+/// views can silently drop a ⌘V they observe but don't act on. The
+/// dictation coordinator's `PasteOutcome` wraps `PasteResult` with a
+/// post-paste AX verification step that surfaces that case.
 public enum PasteResult: Equatable, Sendable {
     case inserted
     case failed
+}
+
+/// What actually happened end-to-end, from the dictation coordinator's
+/// point of view. This is `PasteResult` plus an extra state for the
+/// "cascade said it worked, but the receiving app silently dropped the
+/// paste" case, which is detectable via a cheap post-paste AX read of
+/// the focused element's character count.
+///
+///   • `.succeeded`  — cascade reported `.inserted` AND the focused
+///                     element's text length grew by at least the
+///                     dictation's character count (or AX wouldn't tell
+///                     us, which we treat as success rather than firing
+///                     a false-alarm pill).
+///   • `.failed`     — cascade reported `.failed` (no Accessibility,
+///                     password field refusal, no CGEvent source, both
+///                     stages errored).
+///   • `.silentDrop` — cascade reported `.inserted`, but AX confirmed
+///                     the focused element's text length did not grow
+///                     by the expected amount. Receiving app observed
+///                     the ⌘V but didn't consume it.
+///
+/// Both `.failed` and `.silentDrop` drive the same UI affordance — a
+/// failure pill that tells the user the dictation is on their clipboard
+/// for a manual ⌘V — but the distinction is worth keeping for
+/// telemetry / future per-app handling, since `.silentDrop` is the
+/// cue that this particular target rejects synthesized paste events.
+public enum PasteOutcome: Equatable, Sendable {
+    case succeeded
+    case failed
+    case silentDrop
 }
 
 /// The strategy picked for a single paste call. Produced by

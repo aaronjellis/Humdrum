@@ -32,11 +32,62 @@ Record a 30-second sample, read the long paragraph, stop. Confirm the transcript
 | Stop during "Finalizing…" | No crash, transcript still saves | | |
 | Start a second recording right after stopping | No multi-minute stall; second recording starts clean | | |
 
-## Mutter (⌥Space) paste matrix
+## Mutter dictation v2 (commit-once cadence)
 
-For each target app, focus a text field, press ⌥Space, read the test phrase aloud, wait for silence-timeout to end dictation, and check the result.
+This is the canonical Mutter matrix as of the paste-pivot. Every paste now happens once at end-of-utterance via clipboard + ⌘V — there is no more per-Whisper-commit paste loop. The bug we shipped to fix: long sentences pasted as nothing because per-commit pasteboard restores raced with Electron's lazy clipboard reads. See `mutter-paste-research.md` and `mutter-paste-pivot-plan.md` for the receipts.
 
-Apps are grouped by what we expect the paste cascade to do for them — if an app in the "native AX" group starts failing, that's a hint that our AX-first path has a new edge case; if an app in the "keystroke" group fails, the `skipAXBundleIDPrefixes` routing probably dropped it.
+### What to verify on each cell
+
+For each target app: focus a text field, press ⌥Space, read the test phrase aloud, wait for silence-timeout, then check:
+
+1. **"Listening…" indicator visible mid-dictation.** A small "Listening" label with three pulsing dots should be visible inside the orb the entire time it's onscreen. Constant heartbeat regardless of whether you're speaking — if the dots stop pulsing, something is wrong with the timeline-driven animation.
+2. **Two-phase wind-down on silence.** Stop talking. The countdown ring should drain over your configured `silenceTimeoutSeconds`. After it reaches zero the orb should *then* scale down to nothing over another `silenceTimeoutSeconds` (so total time from last word to teardown ≈ 2× the configured timeout). Speaking during either phase should snap the orb back to full size and reset the ring.
+3. **Single ⌘V at end.** The whole transcript should land in one shot when the orb starts to fade. No partial pastes mid-sentence.
+4. **No StatusPill in the happy path.** The pill should only appear if Accessibility is missing, the cascade refused, or AX detected a silent drop.
+5. **`.silentDrop` pill on Electron silent-drop targets.** Where the receiving app eats the ⌘V (some Electron / hardened web views), the pill should appear with copy "That app didn't take the paste — ⌘V to insert" and the dictation text should still be on the clipboard for at least 3.5 seconds afterwards.
+6. **Clipboard preservation.** The user's prior clipboard contents should be restored ~3 seconds after a successful paste; in the failure path, the dictation text should remain on the clipboard so the manual ⌘V works.
+
+### Critical apps (regression risk)
+
+| App | Short phrase | Long paragraph (>30s) | Tricky chars | Listening dots? | Pill state | Last checked |
+|---|---|---|---|---|---|---|
+| TextEdit | | | | | | |
+| Notes | | | | | | |
+| Mail compose | | | | | | |
+| Safari (Gmail) | | | | | | |
+| Chrome address bar | | | | | | |
+| Slack composer | | | | | | |
+| Claude desktop | | | | | | |
+| Microsoft Teams | | | | | | |
+| Discord | | | | | | |
+| VS Code (editor) | | | | | | |
+| Cursor (editor) | | | | | | |
+| Notion | | | | | | |
+| Linear | | | | | | |
+| Obsidian | | | | | | |
+| IntelliJ / JetBrains | | | | | | |
+| Excel (cell edit) | | | | | | |
+| Word | | | | | | |
+| Terminal / iTerm2 | | | | | | |
+| Warp | | | | | | |
+
+### Failure / refusal paths (must NOT silently lose text)
+
+| Scenario | Pass criteria | Last checked | Notes |
+|---|---|---|---|
+| Long monologue (45+ words, the original bug) | Single ⌘V lands the entire transcript at end | | |
+| 1Password master-password field | Cascade refuses; orb fades; **no** failure pill | | |
+| Banking site password field | Same as 1Password | | |
+| Accessibility revoked mid-dictation | StatusPill flips to "Grant Accessibility…" without restart | | |
+| Electron app that silently drops ⌘V | StatusPill shows `.silentDrop`; clipboard has the text 3.5s later | | |
+| Cascade returns `.failed` | StatusPill shows `.pasteFailed`; clipboard has the text 3.5s later | | |
+| Press ⌥Space, say nothing, wait 8s | No-speech timeout fires; orb fades; no pill, no clipboard touch | | |
+| Press ⌥Space twice rapidly | Second press cancels cleanly; no zombie orb | | |
+| ⌥Space during a meeting recording | Beeps; no orb; meeting unaffected | | |
+
+## Mutter (⌥Space) paste matrix — legacy app coverage
+
+The matrix below was authored for the per-commit paste era. Apps grouped by what we expected the paste cascade to do at the time. Still useful as a coverage checklist: every app that pasted correctly under the old cadence should also paste correctly under commit-once. Treat the AX-first / keystroke split as historical context — under commit-once everything routes clipboard-first.
 
 ### Native AX path (AX first, then keystroke, then clipboard)
 
@@ -128,7 +179,7 @@ Use these exact strings so "it worked" is unambiguous across runs.
    ```
    log stream --predicate 'process == "Humdrum"' --level debug
    ```
-   Look for `[Humdrum]` entries in the output — the ones we added to `runStep`, `finalizeRemaining`, and `DictationCoordinator.handleTextUpdate` surface the actual failure mode.
+   Look for `[Humdrum]` entries in the output — the ones we added to `runStep`, `finalizeRemaining`, and `DictationCoordinator.stop()`'s snapshot continuation surface the actual failure mode.
 3. If it's a "silently no-ops" failure in a previously-working app, that's probably a vendor update breaking AX. Add the bundle ID to `skipAXBundleIDPrefixes` in `PasteHelper.swift` and re-verify.
 4. If it's a keystroke-path app where nothing lands, the usual suspects are: Accessibility permission revoked, the app is sandboxed in a way that blocks synthetic events, or the focused field isn't actually editable.
 

@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import HumdrumCore
 
 // MARK: - Non-focusable floating panel
 
@@ -55,7 +56,8 @@ final class DictationOverlayController {
     // Stacking those on the 260 pt orb means visible diameter can bloom
     // past 400 pt during loud peaks. 460 × 460 leaves comfortable
     // headroom so nothing clips at the panel edge. A VStack below the
-    // orb also hosts the optional permission-warning pill.
+    // orb also hosts the optional `StatusPill` (permission warning,
+    // paste failure, or silent-drop notice).
     private let size = NSSize(width: 460, height: 460)
 
     func show<Content: View>(_ content: Content) {
@@ -97,35 +99,53 @@ final class DictationOverlayController {
 // MARK: - Overlay view
 
 /// Just the orb, on a transparent window — no card, no stroke, no text.
-/// A permission-warning pill slides in underneath when we detect that
-/// Accessibility isn't granted; without it the orb bounces to the user's
-/// voice but typed text never actually lands in the focused field, and
-/// that silent failure is exactly what we want to avoid.
+/// Layered visuals:
+///   • `AudioVisualizer`    — multi-color halo reactive to the mic.
+///   • `ListeningIndicator` — small "Listening…" label inside the orb
+///                            so the user has a constant visual that
+///                            we're capturing audio, even when their
+///                            voice isn't peaking the visualizer.
+///   • `StatusPill`         — single pill below the orb that surfaces
+///                            any condition the user needs to act on:
+///                            Accessibility missing, paste failed,
+///                            paste silently dropped. Hidden in the
+///                            happy path.
 struct DictationOverlayView: View {
     @ObservedObject var manager: TranscriptionManager
     @ObservedObject var dictation: DictationCoordinator
 
     // Orb render size (inside the 460pt panel). Smaller than the
-    // recorder-widget orb because:
-    //   1. The halo + whole-stack scaleEffect can bloom past 2× on
-    //      loud peaks. A 180pt base leaves lots of margin so the
-    //      glow never clips at the panel edge.
-    //   2. The whole orb also scales DOWN to zero as silence
-    //      accumulates (see `silenceScale`), so the floor for
-    //      legibility mid-shrink matters less than generous bloom
-    //      headroom.
+    // recorder-widget orb because the halo + whole-stack scaleEffect
+    // can bloom past 2× on loud peaks. A 180pt base leaves lots of
+    // margin so the glow never clips at the panel edge.
     private let orbSize: CGFloat = 180
 
     var body: some View {
         VStack(spacing: 8) {
-            // Single TimelineView drives everything that animates
-            // continuously: the indicators (chunk-pulse + countdown
-            // ring) and the silence-scale transform on the orb
-            // itself. One timeline source means the scale and the
-            // ring are rendered from the exact same `now`, so they
-            // stay perfectly in sync frame-to-frame.
+            // Single TimelineView drives every continuous animation:
+            // the chunk-pulse confirmation flash, the silence-countdown
+            // ring, and the post-timeout wind-down scale on the orb
+            // itself. One timeline source means everything is rendered
+            // from the same `now`, so the ring drain, the wind-down
+            // scale, and the auto-stop fire stay perfectly aligned.
+            //
+            // Wind-down model (two-phase silence visual):
+            //   Phase 1 — `[0, T]`: full-size orb, ring drains.
+            //             T = `silenceTimeoutSeconds`.
+            //   Phase 2 — `[T, 2T]`: ring is gone, orb scales 1.0 → 0
+            //             over another T. Mic is still hot — speaking
+            //             snaps the orb back to full and resets the
+            //             phase-1 ring. At elapsed = 2T the silence
+            //             monitor fires `stop()` and the orb hides.
+            //
+            // This split exists because users wanted the configured
+            // timeout to mean "you have this long of full-size orb to
+            // think before I start packing up" rather than "I start
+            // packing up the moment you take a breath." See
+            // `DictationCoordinator.evaluateAudio` for the matching
+            // 2× threshold.
             TimelineView(.animation(minimumInterval: 1.0 / 60.0)) { timeline in
-                let scale = silenceScale(now: timeline.date)
+                let scale = windDownScale(now: timeline.date)
                 ZStack {
                     AudioVisualizer(
                         levels: manager.audioLevels,
@@ -134,64 +154,70 @@ struct DictationOverlayView: View {
                     )
                     .frame(width: orbSize, height: orbSize)
 
+                    // "Listening…" inside the orb. Replaces the
+                    // word-ticker experiment (the ticker visibly
+                    // squashed inside the orb and stutter-paused
+                    // because Whisper commits don't tick on every
+                    // word). The label is always-on while the orb is
+                    // up, which is the constant feedback users wanted:
+                    // they don't have to wonder whether the mic is
+                    // hot.
+                    ListeningIndicator(orbDiameter: orbSize)
+
                     indicators(now: timeline.date)
                         .frame(width: orbSize, height: orbSize)
                         .allowsHitTesting(false)
                 }
-                // Shrink (and fade) the orb as silence elapses toward
-                // the user's configured timeout. When the user speaks
-                // again, `lastSpeechTime` advances, elapsed resets,
-                // and the orb springs back to full size. `opacity`
-                // matching `scale` hides the tiny residual dot at the
-                // very end rather than leaving a pinprick behind.
                 .scaleEffect(scale)
                 .opacity(Double(scale))
             }
             .frame(width: orbSize, height: orbSize)
 
-            if !dictation.accessibilityGranted {
-                permissionPill
+            if let status = currentStatus {
+                StatusPill(status: status)
                     .transition(.opacity.combined(with: .move(edge: .bottom)))
+                    .id(status)   // re-fire transition when state flips
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .preferredColorScheme(.dark)
-        .animation(.easeOut(duration: 0.2), value: dictation.accessibilityGranted)
+        .animation(.easeOut(duration: 0.2), value: currentStatus)
     }
 
-    /// Scale factor (1.0 → 0.0) that tracks how much of the current
-    /// silence window has elapsed. Same anchor/total logic as the
-    /// countdown ring — they're two readouts of the same clock:
-    ///
-    ///   • User hasn't spoken yet → anchor = `sessionStartedAt`,
-    ///     total = `noSpeechTimeoutSeconds`.
-    ///   • User has spoken → anchor = `lastSpeechTime`,
-    ///     total = `silenceTimeoutSeconds`.
-    ///
-    /// A 0.4 s grace at the top keeps the orb at full size through
-    /// natural inter-word pauses rather than flickering down on
-    /// every breath.
-    private func silenceScale(now: Date) -> CGFloat {
-        let grace: TimeInterval = 0.4
-        let anchor: Date?
-        let total: TimeInterval
-
-        if let last = dictation.lastSpeechTime {
-            anchor = last
-            total = dictation.silenceTimeoutSeconds
-        } else if let start = dictation.sessionStartedAt {
-            anchor = start
-            total = dictation.noSpeechTimeoutSeconds
-        } else {
-            anchor = nil
-            total = 0
+    /// Resolve the single most-important status condition to surface in
+    /// the pill. Order matters: a paste failure is more urgent than a
+    /// permission warning (the user just lost a dictation; tell them
+    /// where the text is). On success, returns nil → pill is hidden.
+    private var currentStatus: StatusPill.Status? {
+        switch dictation.pasteOutcome {
+        case .failed:      return .pasteFailed
+        case .silentDrop:  return .silentDrop
+        case .succeeded:
+            return dictation.accessibilityGranted ? nil : .accessibilityMissing
         }
+    }
 
-        guard let anchor, total > grace else { return 1.0 }
-        let elapsed = now.timeIntervalSince(anchor)
-        if elapsed <= grace { return 1.0 }
-        let span = total - grace
-        let progress = min(1.0, max(0.0, (elapsed - grace) / span))
+    /// Phase-2 (wind-down) orb scale. See `body` for the model:
+    /// returns 1.0 throughout phase 1 and the no-speech-yet window,
+    /// then linearly shrinks 1.0 → 0 across phase 2 once the
+    /// configured silence timeout has elapsed since last speech.
+    ///
+    /// The `lastSpeechTime` anchor is shared with the silence monitor;
+    /// when the user speaks during phase 2 the anchor jumps forward,
+    /// elapsed snaps back below T, and this function returns 1.0 on
+    /// the next frame — the orb appears to spring back to full size.
+    private func windDownScale(now: Date) -> CGFloat {
+        // Pre-speech window: hold full size; the no-speech timeout
+        // fires its own teardown without a visual wind-down.
+        guard let last = dictation.lastSpeechTime else { return 1.0 }
+        let elapsed = now.timeIntervalSince(last)
+        let phaseOne = dictation.silenceTimeoutSeconds
+        if elapsed <= phaseOne { return 1.0 }
+        // Phase 2: shrink 1.0 → 0 over another silenceTimeoutSeconds.
+        // Total auto-stop firing happens at 2T (see evaluateAudio).
+        let phaseTwo = phaseOne
+        guard phaseTwo > 0 else { return 0 }
+        let progress = min(1.0, max(0.0, (elapsed - phaseOne) / phaseTwo))
         return CGFloat(1.0 - progress)
     }
 
@@ -207,10 +233,12 @@ struct DictationOverlayView: View {
     }
 
     /// Ring that expands outward from the orb edge and fades out when
-    /// a chunk of Whisper text has just been pasted into the focused
-    /// field. Fires for ~0.9 s per chunk. If the user is dictating
-    /// quickly the rings overlap — that's the intended "I'm firing
-    /// off text right now" feel.
+    /// the dictation's transcript has just been pasted into the focused
+    /// field. Under commit-once cadence this fires exactly once per
+    /// dictation, on success — a single satisfying confirmation flash.
+    /// (Function and trigger field names still say "chunk" for legacy
+    /// reasons; the pulse animation is identical to what we used in
+    /// the streaming-paste era when it fired per Whisper commit.)
     @ViewBuilder
     private func chunkPulse(now: Date) -> some View {
         if let pastedAt = dictation.lastChunkPastedAt {
@@ -281,14 +309,65 @@ struct DictationOverlayView: View {
         return (nil, 0)
     }
 
-    /// Shown only when Accessibility isn't granted. Explains in one
-    /// line why no text is appearing and how to fix it. Pointer events
-    /// are passed through on the panel level, so this is purely visual.
-    private var permissionPill: some View {
+}
+
+// MARK: - StatusPill
+
+/// Single pill below the orb that surfaces any user-actionable condition
+/// at the end of (or during) a dictation. Only one state shows at a time
+/// — see `DictationOverlayView.currentStatus` for the precedence order.
+///
+/// All three states use the danger-pink fill so the pill always reads as
+/// "something needs your attention." The icon and copy disambiguate:
+///
+///   • `.accessibilityMissing` — orb is up but won't be able to paste.
+///     Copy points the user to Settings.
+///   • `.pasteFailed`          — cascade refused (no AX, password field,
+///                               etc) or errored. Text was preserved on
+///                               the clipboard; copy tells them so.
+///   • `.silentDrop`           — cascade reported success but the
+///                               receiving app dropped the ⌘V on the
+///                               floor (Electron, hardened web views).
+///                               Same remedy as `.pasteFailed`.
+///
+/// Auto-dismiss is handled by the orb lifecycle itself: failure paths
+/// linger the orb 4.5s before hiding (see DictationCoordinator.stop()),
+/// which is plenty of time to read and act on the pill. The pill never
+/// dismisses early — if the user ⌘Vs while it's still up, that's fine,
+/// the clipboard has the text.
+struct StatusPill: View {
+    enum Status: Hashable {
+        case accessibilityMissing
+        case pasteFailed
+        case silentDrop
+
+        var iconName: String {
+            switch self {
+            case .accessibilityMissing: return "exclamationmark.triangle.fill"
+            case .pasteFailed:          return "exclamationmark.circle.fill"
+            case .silentDrop:           return "exclamationmark.circle.fill"
+            }
+        }
+
+        var message: String {
+            switch self {
+            case .accessibilityMissing:
+                return "Grant Accessibility to paste — see Settings → Dictation"
+            case .pasteFailed:
+                return "Couldn't paste — text on your clipboard, ⌘V to insert"
+            case .silentDrop:
+                return "That app didn't take the paste — ⌘V to insert"
+            }
+        }
+    }
+
+    let status: Status
+
+    var body: some View {
         HStack(spacing: 6) {
-            Image(systemName: "exclamationmark.triangle.fill")
+            Image(systemName: status.iconName)
                 .font(.system(size: 10, weight: .bold))
-            Text("Grant Accessibility to paste — see Settings → Dictation")
+            Text(status.message)
                 .font(.system(size: 11, weight: .medium))
         }
         .foregroundStyle(.white)
@@ -301,5 +380,63 @@ struct DictationOverlayView: View {
             Capsule().stroke(Color.white.opacity(0.25), lineWidth: 0.6)
         )
         .shadow(color: AppTheme.danger.opacity(0.45), radius: 10, y: 3)
+        .allowsHitTesting(false)
+    }
+}
+
+// MARK: - ListeningIndicator
+
+/// Small "Listening" label with three trailing dots that pulse in
+/// sequence, rendered inside the dictation orb. Pure visual feedback
+/// that audio capture is live — the orb's halo already reacts to mic
+/// peaks, but on quieter speech (or while the user is still gathering
+/// their thoughts) the visualizer can read as inert. The dots give a
+/// constant heartbeat so there's no "is it on?" ambiguity.
+///
+/// The label is purely visual — `allowsHitTesting(false)` keeps it out
+/// of the cursor path so the underlying app still gets pointer events.
+private struct ListeningIndicator: View {
+    /// Orb render diameter. Font size scales as a fraction so the
+    /// label looks balanced if the orb's size is ever tuned.
+    let orbDiameter: CGFloat
+
+    /// Per-dot opacity peaks at the same point on each cycle, just
+    /// staggered. 1.2s feels like a natural breathing cadence — fast
+    /// enough to read as alive, slow enough not to feel jittery.
+    private let cycleSeconds: Double = 1.2
+
+    /// Lag between successive dots, as a fraction of the cycle. At
+    /// 0.18 the second and third dots feel like they're chasing the
+    /// first without piling up on top of each other.
+    private let dotLag: Double = 0.18
+
+    private var fontSize: CGFloat { max(11, orbDiameter * 0.085) }
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { ctx in
+            HStack(alignment: .center, spacing: 1) {
+                Text("Listening")
+                    .foregroundStyle(.white.opacity(0.85))
+                ForEach(0..<3, id: \.self) { i in
+                    Text(".")
+                        .foregroundStyle(.white.opacity(dotOpacity(i, at: ctx.date)))
+                }
+            }
+            .font(.system(size: fontSize, weight: .medium, design: .rounded))
+            .shadow(color: .black.opacity(0.35), radius: 2, y: 0)
+        }
+        .frame(width: orbDiameter, height: orbDiameter)
+        .allowsHitTesting(false)
+    }
+
+    /// Sine-wave opacity for a given dot. Phase = cycle position
+    /// shifted by `dotLag * i`. Output mapped to [0.2, 1.0] so dots
+    /// never fully disappear (a flickered-out dot reads as a layout
+    /// bug, not an animation).
+    private func dotOpacity(_ index: Int, at now: Date) -> Double {
+        let secs = now.timeIntervalSinceReferenceDate
+        let phase = (secs / cycleSeconds - Double(index) * dotLag) * 2.0 * .pi
+        let normalized = (sin(phase) + 1.0) / 2.0          // 0..1
+        return 0.2 + 0.8 * normalized
     }
 }

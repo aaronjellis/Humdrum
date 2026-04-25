@@ -2,20 +2,34 @@ import Foundation
 import SwiftUI
 import Combine
 import AppKit
+import AVFoundation
 import Carbon.HIToolbox
 import HumdrumCore
 
-/// Orchestrates Whisper Flow-style dictation.
+/// Orchestrates Whisper Flow-style dictation, commit-once.
 ///
-///   Press ⌥Space → orb appears centered on screen → speak → each
-///   committed Whisper chunk is inserted directly into whatever field
-///   had focus via the Accessibility API → 2.5 s of silence (or another
-///   ⌥Space) stops dictation and hides the orb.
+///   Press ⌥Space → orb appears centered on screen → speak → after
+///   `silenceTimeoutSeconds` of silence the countdown ring drains;
+///   after another `silenceTimeoutSeconds` of continued silence the
+///   orb scales down to zero and dictation auto-stops. (Speaking at
+///   any point during either phase resets the timer.) On stop, we
+///   wait for the tail Whisper pass to finalize, then paste the
+///   entire transcript into the focused field as a single ⌘V.
 ///
-/// Text goes in via `kAXSelectedTextAttribute` only — no clipboard
-/// writes, no synthesized ⌘V keystrokes. See `PasteHelper` for the
-/// rationale (short version: silent clipboard mutation is surprising,
-/// and keystroke fallback hides real permission problems).
+/// Text goes in via clipboard + ⌘V. See `PasteHelper` for the
+/// rationale (short version: ⌘V is the OS-blessed insertion event
+/// every mainstream target accepts, where synthetic unicode key
+/// events get silently filtered by Electron renderers).
+///
+/// Why commit-once instead of paste-as-you-go: the streaming-paste
+/// path used to fire one clipboard write + ⌘V per Whisper commit,
+/// which produced overlapping pasteboard restores that raced with
+/// Electron's lazy clipboard reads. On long dictations the receiver
+/// would consistently land on the *restored* clipboard contents and
+/// nothing would paste at all. Every shipping competitor (Wispr
+/// Flow, Superwhisper, VoiceInk, Aqua Voice) pastes exactly once at
+/// end of utterance for the same reason; see
+/// `docs/mutter-paste-research.md` for the receipts.
 ///
 /// Uses the shared TranscriptionManager but temporarily overrides its
 /// session-completion callback + settings so dictations aren't saved as
@@ -30,15 +44,27 @@ final class DictationCoordinator: ObservableObject {
 
     /// Timestamp of the most recent successful paste into the focused
     /// field. The overlay watches this to flash a short ring-pulse
-    /// around the orb each time a chunk lands — the user gets a
-    /// positive signal that Whisper → paste is flowing, instead of
-    /// wondering if anything's happening.
+    /// around the orb when paste lands — under the new commit-once
+    /// cadence this fires exactly once per dictation, on success, at
+    /// the moment the final transcript is delivered to the focused
+    /// field. The orb's existing pulse animation handles either one
+    /// or many triggers gracefully, so we get a single satisfying
+    /// confirmation flash for free.
     @Published private(set) var lastChunkPastedAt: Date?
 
-    /// Timestamp of the most recent activity (speech OR paste). The
-    /// overlay reads this to render a shrinking silence-countdown
-    /// ring; when the elapsed time since this moment reaches
-    /// `silenceTimeoutSeconds`, dictation auto-closes.
+    /// Outcome of the most recent dictation's paste, surfaced to the
+    /// overlay's status pill. Defaults to `.succeeded` so the UI
+    /// stays clean before the user has dictated anything; flipped
+    /// inside `stop()` after the paste completes and (for `.inserted`
+    /// results) the post-paste AX verification runs.
+    @Published private(set) var pasteOutcome: PasteOutcome = .succeeded
+
+    /// Timestamp of the most recent detected speech. The overlay
+    /// reads this twice: the silence-countdown ring drains over
+    /// `silenceTimeoutSeconds` (phase 1), then the orb scales 1.0 →
+    /// 0 over another `silenceTimeoutSeconds` (phase 2). When the
+    /// elapsed time reaches `silenceTimeoutSeconds * 2` the silence
+    /// monitor fires `stop()`.
     @Published private(set) var lastSpeechTime: Date?
 
     /// Timestamp of the current dictation session's start. Exposed so
@@ -74,7 +100,14 @@ final class DictationCoordinator: ObservableObject {
     /// (so hitting the hotkey by accident doesn't leave an orb onscreen
     /// forever).
     var noSpeechTimeoutSeconds: TimeInterval = 8.0
-    /// Mic RMS below this counts as silence.
+    /// Raw-RMS cutoff below which we consider the last 50 ms of mic
+    /// audio "silence." Compared against `manager.currentRMS`, which
+    /// publishes the un-boosted mic energy directly — do NOT compare
+    /// this against `manager.audioLevels` (those are visualizer-
+    /// boosted by 14× and will never cross this threshold in real
+    /// room conditions, which is why the silence auto-stop never
+    /// fired before). 0.015 is a decent "normal speaker in a normal
+    /// room" boundary; quieter rooms may want lower.
     var silenceRMSThreshold: Float = 0.015
 
     // MARK: - Dependencies
@@ -85,13 +118,12 @@ final class DictationCoordinator: ObservableObject {
 
     // MARK: - Session state
 
-    private var pastedText: String = ""            // what we've already sent to the focused field
     private var savedOnCompleted: ((TranscriptSessionSnapshot) -> Void)?
     private var savedSpeakerLabels: Bool = false
     private var savedNoiseFilter: NoiseFilterLevel = .normal
     private var savedVocabHints: String = ""
+    private var savedCommitThresholds: CommitThresholds = .meeting
 
-    private var commitsSink: AnyCancellable?
     private var silenceTask: Task<Void, Never>?
     private var tccObserver: NSObjectProtocol?
     private var accessibilityPollTimer: Timer?
@@ -284,7 +316,7 @@ final class DictationCoordinator: ObservableObject {
             return
         }
 
-        pastedText = ""
+        pasteOutcome = .succeeded
         lastSpeechTime = nil
         lastChunkPastedAt = nil
         sessionStartedAt = Date()
@@ -317,17 +349,23 @@ final class DictationCoordinator: ObservableObject {
         savedSpeakerLabels = manager.speakerLabelsEnabled
         savedNoiseFilter = manager.noiseFilterLevel
         savedVocabHints = manager.vocabularyHints
+        savedCommitThresholds = manager.commitThresholds
 
-        manager.onSessionCompleted = { _ in /* suppressed for dictation */ }
+        // Clear the manager's session-completion callback for the
+        // duration of dictation. Dictations aren't meetings — they
+        // don't get persisted as sessions. We re-install a one-shot
+        // callback inside `stop()`'s continuation flow to capture the
+        // final tail-pass snapshot for paste; that callback is
+        // self-cleanup and the production handler is restored before
+        // we return to the meeting flow.
+        manager.onSessionCompleted = nil
         manager.speakerLabelsEnabled = false
         manager.noiseFilterLevel = .strict
-
-        // Observe committed transcript for incremental paste.
-        commitsSink = manager.$confirmedText
-            .sink { [weak self] newText in
-                guard let self else { return }
-                Task { @MainActor in self.handleTextUpdate(newText) }
-            }
+        // Switch the manager's commit cadence to "dictation": short
+        // windows, tight tail-silence. Even though paste happens once
+        // at end-of-utterance, the tighter cadence keeps the tail
+        // Whisper pass cheap so `stop()` finalizes quickly.
+        manager.commitThresholds = .dictation
 
         // Reset the session anchor now that the model is actually
         // ready — otherwise a slow first-time model download would
@@ -338,6 +376,34 @@ final class DictationCoordinator: ObservableObject {
 
         startSilenceMonitor()
         await manager.start()
+
+        // Surface a mic-denied / device-error up front instead of
+        // letting the user stare at the orb for 8 seconds waiting for
+        // the no-speech timeout. If isRecording didn't flip true,
+        // manager.start() aborted — status carries the human-readable
+        // reason — so we tear the overlay down, restore settings, and
+        // beep. The user sees the manager's status string in the main
+        // window next time they open it.
+        if !manager.isRecording {
+            isDictating = false
+            silenceTask?.cancel()
+            silenceTask = nil
+            manager.onSessionCompleted = savedOnCompleted
+            manager.speakerLabelsEnabled = savedSpeakerLabels
+            manager.noiseFilterLevel = savedNoiseFilter
+            manager.vocabularyHints = savedVocabHints
+            manager.commitThresholds = savedCommitThresholds
+            overlay.hide()
+            NSSound.beep()
+            // If permission was the issue, flip macOS over to the right
+            // settings pane — same move as the menu-bar helper. Users
+            // on a denied state otherwise have no discoverable path to
+            // fix it without reopening the main window.
+            if AVCaptureDevice.authorizationStatus(for: .audio) == .denied,
+               let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") {
+                NSWorkspace.shared.open(url)
+            }
+        }
     }
 
     // MARK: - Stop
@@ -351,72 +417,157 @@ final class DictationCoordinator: ObservableObject {
     private func stop(reason: StopReason) async {
         guard isDictating else { return }
         isDictating = false
+        _ = reason  // not used today; retained on the signature for telemetry hooks
 
-        commitsSink?.cancel()
-        commitsSink = nil
         silenceTask?.cancel()
         silenceTask = nil
 
-        await manager.stop()
+        // Capture the final snapshot via a single-await continuation.
+        // Three things race inside it:
+        //   1. We install a one-shot `onSessionCompleted` callback
+        //      that resumes the continuation with the snapshot.
+        //   2. We arm a 5s safety timeout that resumes with `nil`.
+        //   3. We kick off `manager.stop()`, which ultimately fires
+        //      the callback after the tail Whisper pass completes.
+        // Whichever resolves first wins; the loser is a no-op via the
+        // single-resume latch. The 5s deadline is intentionally
+        // tighter than the manager's own 30s finalize budget — that
+        // budget exists for meeting-mode windows; dictation-mode
+        // segments cap at 7s so the tail pass finalizes well under
+        // a second on the happy path. We'd rather paste whatever
+        // confirmedText reads than strand the orb on screen.
+        let snapshot: TranscriptSessionSnapshot? = await withCheckedContinuation {
+            (cont: CheckedContinuation<TranscriptSessionSnapshot?, Never>) in
 
-        // Paste any final delta that arrived during finalize.
-        let remaining = computeDelta(manager.confirmedText)
-        if !remaining.isEmpty {
-            PasteHelper.paste(remaining)
-            pastedText = manager.confirmedText
+            let latch = SingleResumeLatch<TranscriptSessionSnapshot?>(continuation: cont)
+
+            let timeout = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
+                latch.resume(nil)
+            }
+
+            manager.onSessionCompleted = { snap in
+                timeout.cancel()
+                latch.resume(snap)
+            }
+
+            Task { @MainActor [weak self] in
+                await self?.manager.stop()
+            }
+        }
+
+        // Resolve the final text. Prefer the snapshot's transcript
+        // (which includes anything that only landed via the tail pass);
+        // fall back to live `confirmedText` if the snapshot timed out.
+        // Trim trailing whitespace — Whisper sometimes leaves a
+        // hanging space after the last token, and we don't want
+        // that landing in the user's focused field.
+        let rawText = snapshot?.transcriptText ?? manager.confirmedText
+        let finalText = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if finalText.isEmpty {
+            // User hit ⌥Space twice with nothing said, or speech
+            // didn't pass Whisper's confidence threshold. Treat as
+            // trivial success so the failure pill doesn't fire.
+            pasteOutcome = .succeeded
+        } else {
+            // Snapshot the focused element's character count *before*
+            // posting ⌘V. nil means AX won't tell us (Electron, some
+            // hardened web views) — `verifyInsertion` treats nil as
+            // "unknown, assume succeeded" rather than firing a
+            // false-positive silent-drop pill on apps where we can't
+            // observe the insertion either way.
+            let baselineLength = PasteHelper.focusedTextLength()
+            let result = PasteHelper.paste(finalText)
+            switch result {
+            case .inserted:
+                pasteOutcome = await verifyInsertion(finalText, before: baselineLength)
+                if pasteOutcome == .succeeded {
+                    // Single satisfying ring-pulse confirmation.
+                    lastChunkPastedAt = Date()
+                }
+            case .failed:
+                pasteOutcome = .failed
+                // Refresh status so the overlay reflects a freshly-
+                // revoked Accessibility grant (or similar) without a
+                // delay.
+                refreshAccessibilityStatus()
+            }
+        }
+
+        // Failure-path clipboard preservation. The cascade restored
+        // (or is about to restore) the user's prior clipboard
+        // contents 3.0s after `setString`. In the failure paths we
+        // want the dictation text to outlast that restore so the
+        // user can ⌘V the dictation manually. Re-write now (so a
+        // fast-fingered user who reads the pill immediately can ⌘V
+        // before the restore even runs) and again at +3.5s (so we
+        // beat the restore for slower users). See the research memo
+        // for the race details.
+        //
+        // We accept the known cosmetic cost: heavy clipboard managers
+        // (Alfred, Raycast, Paste) may show a transient duplicate
+        // entry for the dictation text. Acceptable trade for never
+        // silently losing a dictation.
+        if !finalText.isEmpty, pasteOutcome != .succeeded {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(finalText, forType: .string)
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 3_500_000_000)
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(finalText, forType: .string)
+            }
         }
 
         // Restore manager settings so meeting mode works as before.
+        // Order matters: this comes AFTER the snapshot continuation
+        // resolved, so our one-shot onSessionCompleted callback has
+        // already done its job. Restoring `savedOnCompleted` here
+        // re-arms the production session-saving handler before the
+        // user can start the next meeting.
         manager.onSessionCompleted = savedOnCompleted
         manager.speakerLabelsEnabled = savedSpeakerLabels
         manager.noiseFilterLevel = savedNoiseFilter
         manager.vocabularyHints = savedVocabHints
+        manager.commitThresholds = savedCommitThresholds
 
-        // Delay hide slightly so the last paste lands before the window
-        // teardown flickers.
-        try? await Task.sleep(nanoseconds: 120_000_000)
+        // Outcome-dependent orb linger. On success, we want enough
+        // time for ⌘V to paint in the target app and the user to
+        // register the ring-pulse confirmation — but not so long
+        // that the orb feels sticky. On failure, the orb needs to
+        // hold long enough that the failure pill is readable and
+        // actionable.
+        let lingerNs: UInt64 = (pasteOutcome == .succeeded) ? 250_000_000 : 4_500_000_000
+        try? await Task.sleep(nanoseconds: lingerNs)
+
         overlay.hide()
     }
 
-    // MARK: - Real-time paste
-
-    private func handleTextUpdate(_ newText: String) {
-        let delta = computeDelta(newText)
-        guard !delta.isEmpty else { return }
-
-        let result = PasteHelper.paste(delta)
-        lastSpeechTime = Date()
-
-        // Only advance `pastedText` when the cascade actually inserted
-        // the chunk. If we advanced on `.failed` we'd silently drop the
-        // delta forever — the next tick's computeDelta would no longer
-        // include it. Leaving `pastedText` in place means the missed
-        // chunk gets retried on the next Whisper update.
-        switch result {
-        case .inserted:
-            pastedText = newText
-            // Publish the paste timestamp so the overlay's ring-pulse
-            // animation fires — user gets a confirmation burst every
-            // time a chunk successfully lands in the focused field.
-            lastChunkPastedAt = Date()
-        case .failed:
-            // Refresh status so the overlay's warning pill can appear
-            // (e.g. user revoked Accessibility mid-session) instead of
-            // silently pretending everything's fine.
-            refreshAccessibilityStatus()
-        }
-    }
-
-    /// Diff between what the manager has committed and what we've already
-    /// sent to the focused field. Defensive: if the committed text ever
-    /// diverges (Whisper rewrites older chunks), we skip the update and
-    /// wait for it to reconverge rather than send unintended keystrokes.
-    private func computeDelta(_ newText: String) -> String {
-        if newText.hasPrefix(pastedText) {
-            return String(newText.dropFirst(pastedText.count))
-        }
-        // Divergence — don't type anything; wait for the next commit.
-        return ""
+    /// Cheap post-paste AX verification. Reads the focused element's
+    /// character count 250ms after we posted ⌘V and compares against
+    /// the pre-paste baseline. If the count grew by at least the
+    /// dictation's character length, paste succeeded. If it didn't,
+    /// the receiving app silently dropped the ⌘V — Electron renderers
+    /// and some hardened web views observe paste events but don't
+    /// always consume them.
+    ///
+    /// `nil` baseline OR `nil` post-paste read both downgrade to
+    /// `.succeeded`: if AX won't tell us, we'd rather not fire a
+    /// false-alarm pill on apps where we can't observe the insertion
+    /// either way. Aggressive multi-tick polling would catch more
+    /// silent drops but adds perceptible orb-linger and trips on
+    /// slow renderers; the single-read approach is the 90% solution
+    /// at 10% of the cost.
+    ///
+    /// 250ms is the minimum that comfortably handles Electron's lazy-
+    /// read pattern. Longer than that and the orb teardown lingers
+    /// visibly; shorter and we'd trip false-positive silent drops on
+    /// slow renderers.
+    private func verifyInsertion(_ text: String, before: Int?) async -> PasteOutcome {
+        guard let before else { return .succeeded }
+        try? await Task.sleep(nanoseconds: 250_000_000)
+        guard let after = PasteHelper.focusedTextLength() else { return .succeeded }
+        return (after - before) >= text.count ? .succeeded : .silentDrop
     }
 
     // MARK: - Silence monitor
@@ -431,10 +582,13 @@ final class DictationCoordinator: ObservableObject {
     }
 
     private func evaluateAudio() {
-        let avg = manager.audioLevels.isEmpty
-            ? 0
-            : manager.audioLevels.reduce(0, +) / Float(manager.audioLevels.count)
-        let isSpeaking = avg >= silenceRMSThreshold
+        // Compare against the manager's RAW RMS, not the boosted
+        // `audioLevels`. The old code averaged the three boosted +
+        // smoothed visualizer levels and compared to 0.015 — that
+        // threshold maps to roughly 0.001 raw, which real rooms
+        // rarely clear, so the silence auto-stop effectively never
+        // fired. Real-mic silence crosses below 0.015 raw routinely.
+        let isSpeaking = manager.currentRMS >= silenceRMSThreshold
 
         if isSpeaking {
             lastSpeechTime = Date()
@@ -450,8 +604,16 @@ final class DictationCoordinator: ObservableObject {
         }
 
         // Had speech already — check the "stopped talking" timeout.
+        // Auto-stop fires at 2 × `silenceTimeoutSeconds`. The first
+        // window is the user-facing "you have this long to think before
+        // I start packing up" phase the countdown ring drains over;
+        // the second is the visual wind-down where the orb scales 1.0
+        // → 0 (see `DictationOverlayView.windDownScale`). Speaking at
+        // any point during either phase advances `lastSpeechTime`,
+        // resetting the elapsed back to zero — exactly the
+        // "speak again to reactivate" affordance the user asked for.
         if let last = lastSpeechTime,
-           Date().timeIntervalSince(last) >= silenceTimeoutSeconds {
+           Date().timeIntervalSince(last) >= silenceTimeoutSeconds * 2 {
             Task { await self.stop(reason: .silenceTimeout) }
         }
     }
@@ -462,5 +624,33 @@ final class DictationCoordinator: ObservableObject {
         if let tccObserver {
             DistributedNotificationCenter.default().removeObserver(tccObserver)
         }
+    }
+}
+
+// MARK: - SingleResumeLatch
+//
+// Used by `stop()`'s snapshot-capture continuation. Both the snapshot
+// callback and the safety timeout race to resume the same checked
+// continuation; whichever wins, the loser must be a no-op (otherwise
+// `withCheckedContinuation` traps with a fatal error on double-resume).
+//
+// We don't reach for atomics: both branches run on @MainActor (the
+// timeout Task is `@MainActor` and the manager fires
+// `onSessionCompleted` on the main thread). A plain `Bool` guarded by
+// the actor's serialization is sufficient.
+
+@MainActor
+private final class SingleResumeLatch<T> {
+    private var resumed = false
+    private let continuation: CheckedContinuation<T, Never>
+
+    init(continuation: CheckedContinuation<T, Never>) {
+        self.continuation = continuation
+    }
+
+    func resume(_ value: T) {
+        guard !resumed else { return }
+        resumed = true
+        continuation.resume(returning: value)
     }
 }

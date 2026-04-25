@@ -69,7 +69,9 @@ enum PasteHelper {
     /// the environment, asks `PasteCascade` which strategy to run, and
     /// hands the decision to `PasteCascade.execute` against the real
     /// backend. Returns HumdrumCore's `PasteResult`, which the coordinator
-    /// switches on to flash the chunk pulse or surface the warning pill.
+    /// switches on to flash the success ring-pulse or surface the
+    /// failure StatusPill (and to drive the post-paste AX silent-drop
+    /// verification on the `.inserted` branch).
     @discardableResult
     static func paste(_ text: String) -> PasteResult {
         let decision = PasteCascade.decide(
@@ -95,6 +97,53 @@ enum PasteHelper {
     /// background system helpers).
     private static func frontmostBundleID() -> String? {
         NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+    }
+
+    /// Character count of the currently-focused element's text, if AX
+    /// will tell us. Used by the dictation coordinator to verify
+    /// post-paste that the receiving app actually accepted the ⌘V —
+    /// the receiver's text length should grow by at least the length
+    /// of the dictated string. Returns `nil` when the element refuses
+    /// the read, which is the common case for Electron and Chromium
+    /// renderers; the coordinator treats `nil` as "unknown, assume
+    /// success" rather than firing a false-positive silent-drop
+    /// warning.
+    ///
+    /// We try `kAXNumberOfCharactersAttribute` first (the dedicated
+    /// length attribute, supported by native Cocoa text views) and
+    /// fall back to reading `kAXValue` and measuring its length, which
+    /// works for elements that expose the value but not the length
+    /// attribute (some web text inputs).
+    static func focusedTextLength() -> Int? {
+        let system = AXUIElementCreateSystemWide()
+        var focusedRaw: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(
+            system,
+            kAXFocusedUIElementAttribute as CFString,
+            &focusedRaw
+        ) == .success, let focusedRaw else { return nil }
+        let element = focusedRaw as! AXUIElement
+
+        var lenRaw: CFTypeRef?
+        if AXUIElementCopyAttributeValue(
+            element,
+            kAXNumberOfCharactersAttribute as CFString,
+            &lenRaw
+        ) == .success, let n = lenRaw as? Int {
+            return n
+        }
+
+        // Fallback: AXValue string length. Some web inputs expose the
+        // value but not a dedicated character count.
+        var valueRaw: CFTypeRef?
+        if AXUIElementCopyAttributeValue(
+            element,
+            kAXValueAttribute as CFString,
+            &valueRaw
+        ) == .success, let s = valueRaw as? String {
+            return s.count
+        }
+        return nil
     }
 
     /// AX role of the currently-focused UI element, if we can read it.
@@ -237,9 +286,10 @@ private struct RealPasteBackend: PasteBackend {
     /// filtered by Electron renderers.
     ///
     /// The restore delay needs to be long enough that the receiving app
-    /// has finished reading the pasteboard in response to ⌘V. 350ms is
-    /// comfortably past the worst case we've observed. Wispr Flow uses
-    /// ~500ms for the same reason.
+    /// has finished reading the pasteboard in response to ⌘V. We're
+    /// pasting exactly once per dictation now, so the restore window
+    /// can be generous — 3.0s, matching Superwhisper. See the comment
+    /// on the actual `asyncAfter` call below for the full reasoning.
     func insertViaClipboard(_ text: String) -> Bool {
         guard let source = CGEventSource(stateID: .combinedSessionState) else {
             return false
@@ -251,20 +301,57 @@ private struct RealPasteBackend: PasteBackend {
         pasteboard.clearContents()
         pasteboard.setString(text, forType: .string)
 
-        // ⌘V — virtual key 9 is "V" on every Apple keyboard layout.
-        guard let vDown = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: true),
-              let vUp   = CGEvent(keyboardEventSource: source, virtualKey: 9, keyDown: false) else {
+        // Give the pasteboard change time to propagate before we fire
+        // ⌘V. Electron renderers (Claude desktop, Slack, Discord) and
+        // some Cocoa apps observe pasteboard change notifications and
+        // can drop a ⌘V that arrives on the same run-loop turn as the
+        // `setString` — the receiver still sees the *old* contents.
+        // 15ms is below user-perception threshold for a dictation
+        // chunk and matches what Wispr Flow does.
+        usleep(15_000)
+
+        // Post ⌘V as an explicit 4-event sequence: cmd-down, V-down,
+        // V-up, cmd-up. We used to only set `.maskCommand` on the V
+        // events and post those two, but that's silently dropped by
+        // some Electron renderers (Claude desktop was the motivating
+        // case) which listen for actual modifier keyDown events, not
+        // the flag. Virtual keys: 0x37 is Left Command, 9 is "V" on
+        // every Apple keyboard layout.
+        guard let cmdDown = CGEvent(keyboardEventSource: source, virtualKey: 0x37, keyDown: true),
+              let vDown   = CGEvent(keyboardEventSource: source, virtualKey: 9,    keyDown: true),
+              let vUp     = CGEvent(keyboardEventSource: source, virtualKey: 9,    keyDown: false),
+              let cmdUp   = CGEvent(keyboardEventSource: source, virtualKey: 0x37, keyDown: false) else {
             restorePasteboard(pasteboard, snapshot: saved)
             return false
         }
+        // Both V events still carry the cmd flag — some apps key off
+        // `event.flags` rather than the modifier-event history.
         vDown.flags = .maskCommand
         vUp.flags   = .maskCommand
+        cmdDown.post(tap: .cghidEventTap)
         vDown.post(tap: .cghidEventTap)
         vUp.post(tap: .cghidEventTap)
+        cmdUp.post(tap: .cghidEventTap)
 
-        // Restore on the main queue after the receiving app has had time
-        // to pick up the pasteboard contents.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+        // Restore on the main queue after the receiving app has had
+        // time to pick up the pasteboard contents. We're now in the
+        // commit-once world (one paste per dictation, not one per
+        // Whisper commit), so a longer restore window is free —
+        // there's no back-pressure from the next paste. 3.0s matches
+        // Superwhisper's known-good value; their telemetry says it's
+        // the floor at which Electron renderers' lazy pasteboard
+        // reads are reliably done. Wispr Flow holds at ~500ms but
+        // they have telemetry to verify it for them; we'd rather
+        // pay 2.5 extra seconds of "your copied text comes back
+        // slightly later" than risk a missed paste because Slack's
+        // observer fired at +900ms.
+        //
+        // Note: the dictation coordinator's failure path (silent drop
+        // or cascade refusal) re-writes the dictation text to the
+        // clipboard immediately and again at +3.5s, so the user's
+        // ⌘V still sees the dictation text even if this restore wins
+        // the race. See `DictationCoordinator.stop()`.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
             restorePasteboard(pasteboard, snapshot: saved)
         }
         return true
