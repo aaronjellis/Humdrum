@@ -18,7 +18,7 @@ on:
 
 jobs:
   build-and-release:
-    runs-on: macos-14
+    runs-on: macos-15
     permissions:
       contents: write   # gh release create + push to gh-pages
 
@@ -28,8 +28,25 @@ jobs:
         with:
           fetch-depth: 0     # build-app.sh reads git history for build number
 
-      - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode_15.4.app
+      - name: Select Xcode (Swift 6+)
+        run: |
+          # WhisperKit transitively depends on swift-transformers, which
+          # in turn pulls swift-jinja 2.x. swift-jinja 2.0+ declares
+          # `swift-tools-version: 6.0`, so SPM refuses to resolve under
+          # any Swift 5 toolchain (Xcode 15.x). Pick the highest Xcode
+          # 16+ installed on the runner; macos-15 ships several. We
+          # don't pin a specific 16.x version because the runner image
+          # rotates them and pinning forces a workflow edit on every
+          # bump — picking max-installed is the lowest-friction option.
+          XCODE_PATH=$(ls -d /Applications/Xcode_16*.app /Applications/Xcode_17*.app 2>/dev/null | sort -V | tail -1)
+          if [ -z "$XCODE_PATH" ]; then
+            echo "No Xcode 16+ found on runner. Available:"
+            ls -d /Applications/Xcode*.app
+            exit 1
+          fi
+          echo "Selecting: $XCODE_PATH"
+          sudo xcode-select -s "$XCODE_PATH"
+          swift --version
 
       - name: Import Developer ID signing cert
         env:
