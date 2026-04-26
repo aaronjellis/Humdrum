@@ -336,11 +336,24 @@ done < <(find "${APP_DIR}/Contents/Resources" \
            -print0)
 
 # Sign everything inside Contents/Frameworks/ — Sparkle specifically ships
-# four nested code-bearing artifacts (Autoupdate, Updater.app, Downloader
-# .xpc, Installer.xpc) that MUST each carry a valid signature before the
-# outer framework signature is applied, and the outer framework signature
-# must land before we sign the app bundle. Walk deepest-first (-depth) so
-# children are signed before their parents.
+# five nested code-bearing artifacts (Autoupdate, Updater.app, Downloader
+# .xpc, Installer.xpc, the framework itself) that MUST each carry a valid
+# Developer ID signature before the outer framework signature is applied,
+# and the outer framework signature must land before we sign the app
+# bundle. Walk deepest-first (-depth) so children are signed before their
+# parents — codesign seals a bundle's contents at sign time, so a child
+# resigned after its parent invalidates the parent's seal.
+#
+# The case is split into:
+#   • known bundle wrappers (.dylib / .framework / .xpc / .app) — sign
+#     unconditionally, codesign handles the bundle vs. binary semantics.
+#   • bare Mach-O executables (no extension) — Sparkle's `Autoupdate`
+#     is the canonical example. Apple's notary rejects these if they
+#     carry only the upstream maintainer's signature (or an ad-hoc
+#     signature, which is what we shipped before — local builds used
+#     `--skip-notarize` so this stayed latent until the first real
+#     notary submission). We use `file` to detect Mach-O so we don't
+#     try to codesign random text/resources.
 while IFS= read -r -d '' item; do
   case "$item" in
     *.dylib|*.framework|*.xpc|*.app)
@@ -348,10 +361,16 @@ while IFS= read -r -d '' item; do
         --sign "${SIGN_IDENTITY}" \
         "${item}"
       ;;
+    *)
+      if [ -f "$item" ] && [ -x "$item" ] \
+         && file -b "$item" 2>/dev/null | grep -qE '^Mach-O'; then
+        codesign --force --timestamp --options runtime \
+          --sign "${SIGN_IDENTITY}" \
+          "${item}"
+      fi
+      ;;
   esac
-done < <(find "${APP_DIR}/Contents/Frameworks" -depth \
-           \( -name '*.dylib' -o -name '*.framework' -o -name '*.xpc' -o -name '*.app' \) \
-           -print0)
+done < <(find "${APP_DIR}/Contents/Frameworks" -depth -print0)
 
 # Sign the main executable explicitly with entitlements so the
 # hardened-runtime exceptions in Humdrum.entitlements are applied.
