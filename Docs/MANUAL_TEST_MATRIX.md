@@ -85,6 +85,11 @@ For each target app: focus a text field, press ⌥Space, read the test phrase al
 | Press ⌥Space, say nothing, wait 8s | No-speech timeout fires; orb fades; no pill, no clipboard touch | | |
 | Press ⌥Space twice rapidly | Second press cancels cleanly; no zombie orb | | |
 | ⌥Space during a meeting recording | Beeps; no orb; meeting unaffected | | |
+| Pause mid-utterance with ⌥P | Orb dims to ~55%, "Paused" replaces listening dots, ring freezes at full; speech is ignored; ⌥P again resumes with a fresh silenceTimeoutSeconds runway and no double-paste | | |
+| Pause, wait 30s, resume, finish utterance | No timeout fires while paused; on resume, the *same* session's tail diff-pastes correctly at the next phase-1 boundary | | |
+| Escape mid-utterance | Red ring expands ~350 ms over the orb, orb fades, NO paste of the un-committed tail; previously-pasted text in target app is left alone (no undo); no failure pill | | |
+| Escape immediately after a phase-1 commit | The text that already pasted stays pasted; nothing else fires; no zombie orb | | |
+| Press ⌥Space immediately after Escape | New session starts cleanly with a fresh `savedOnCompleted` (no leakage of cancellation behavior into the next recording) | | |
 
 ## Mutter (⌥Space) paste matrix — legacy app coverage
 

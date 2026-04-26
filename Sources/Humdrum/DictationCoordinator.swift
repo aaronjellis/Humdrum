@@ -56,6 +56,21 @@ final class DictationCoordinator: ObservableObject {
     @Published private(set) var isDictating: Bool = false
     @Published private(set) var accessibilityGranted: Bool = false
 
+    /// True while the user has tapped ⌥P to pause an active dictation.
+    /// The orb stays on screen, manager keeps recording (so resuming
+    /// is instantaneous) but `evaluateAudio()` early-returns so no
+    /// silence detection or phase-1 commits fire while paused. The
+    /// overlay watches this flag to dim the orb and freeze the ring.
+    /// Reset to false on every fresh `start()` and on resume.
+    @Published private(set) var isPaused: Bool = false
+
+    /// Timestamp set the moment the user hits Escape to cancel an
+    /// active dictation. The overlay watches this to render a brief
+    /// red ring-pulse around the orb so the cancel reads as
+    /// intentional rather than as an unexplained fade. Cleared on
+    /// the next `start()`.
+    @Published private(set) var cancelFlashAt: Date?
+
     /// Timestamp of the most recent successful paste into the focused
     /// field. The overlay watches this to flash a short ring-pulse
     /// around the orb when paste lands. Fires on each phase-1
@@ -138,7 +153,12 @@ final class DictationCoordinator: ObservableObject {
 
     private let manager: TranscriptionManager
     private let overlay = DictationOverlayController()
-    private let hotkey = HotkeyManager()
+    private let hotkey = HotkeyManager(id: 1)
+    /// Conditional hotkey, only armed while the orb is up. Tap ⌥P to
+    /// freeze the engine without losing the session; tap again to
+    /// resume. Lives on its own HotkeyManager instance (id: 2) so it
+    /// doesn't collide with the global ⌥Space toggle (id: 1).
+    private let pauseHotkey = HotkeyManager(id: 2)
 
     // MARK: - Session state
 
@@ -179,6 +199,15 @@ final class DictationCoordinator: ObservableObject {
     /// Cancelled on the next `start()` instead, which is the
     /// earliest moment a stale task could harm a live clipboard.
     private var clipboardPreservationTask: Task<Void, Never>?
+
+    /// Token returned by `NSEvent.addGlobalMonitorForEvents` (and the
+    /// matching local monitor) for the Escape-to-cancel handler. Both
+    /// monitors are armed in `start()` after the orb is up and torn
+    /// down in `stop()` / `cancel()` so we're not eavesdropping on
+    /// every keystroke globally outside an active dictation. Stored
+    /// as `Any?` because the AppKit return type is opaque.
+    private var escapeMonitor: Any?
+    private var localEscapeMonitor: Any?
 
     // MARK: - Init
 
@@ -376,6 +405,8 @@ final class DictationCoordinator: ObservableObject {
         commitInProgress = false
         clipboardPreservationTask?.cancel()
         clipboardPreservationTask = nil
+        isPaused = false
+        cancelFlashAt = nil
 
         // Show the orb IMMEDIATELY so the user gets feedback, even if
         // we need a few seconds to load the model first. The overlay
@@ -459,7 +490,13 @@ final class DictationCoordinator: ObservableObject {
                let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") {
                 NSWorkspace.shared.open(url)
             }
+            return
         }
+
+        // Engine is hot and the orb is visible — arm the conditional
+        // bindings that only make sense during an active dictation.
+        installPauseHotkey()
+        installEscapeMonitor()
     }
 
     // MARK: - Stop
@@ -473,9 +510,16 @@ final class DictationCoordinator: ObservableObject {
     private func stop(reason: StopReason) async {
         guard isDictating else { return }
         isDictating = false
+        isPaused = false
 
         silenceTask?.cancel()
         silenceTask = nil
+
+        // Conditional bindings (pause hotkey, escape monitor) only
+        // make sense while the orb is up. Tear them down before the
+        // orb hides so we don't eavesdrop on every keystroke between
+        // sessions.
+        teardownConditionalBindings()
 
         // Capture the final snapshot via a single-await continuation.
         // Three things race inside it:
@@ -744,6 +788,148 @@ final class DictationCoordinator: ObservableObject {
         }
     }
 
+    // MARK: - Pause / Cancel
+
+    /// Tap-⌥P handler. Toggles `isPaused`. The orb stays visible in
+    /// either state — the overlay watches `isPaused` to dim the orb
+    /// and freeze the silence ring while paused. The transcription
+    /// manager keeps recording, so resume is instantaneous, but
+    /// `evaluateAudio()` early-returns so no silence detection or
+    /// phase-1 commits fire while paused. We also re-anchor
+    /// `lastSpeechTime` to the moment of (un)pause so the ring renders
+    /// from full when entering paused (no flicker as elapsed jumps
+    /// past T) and gets a fresh runway on resume.
+    private func togglePause() {
+        guard isDictating else { return }
+        isPaused.toggle()
+        // Refresh the speech anchor either way — entering pause
+        // freezes the ring at full (recent speech), and exiting
+        // pause gives the user the full silenceTimeoutSeconds before
+        // a phase-1 commit fires.
+        lastSpeechTime = Date()
+    }
+
+    /// Escape handler. Tears the orb down without pasting whatever
+    /// new tail has accumulated since the last phase-1 commit.
+    /// Already-pasted text from earlier commits is untouched — undoing
+    /// text that's already landed in another app is a can of worms
+    /// macOS apps don't generally have a sane way to open. Sets
+    /// `cancelFlashAt` so the overlay can paint a brief red ring
+    /// before fade so the user reads the cancel as intentional.
+    ///
+    /// We mark the cancel as a successful outcome (no failure pill)
+    /// — the user explicitly threw the work away, that's not an
+    /// error worth surfacing. We do NOT touch the clipboard: if a
+    /// previous phase-1 commit's failure path armed a preservation
+    /// task, that text is still useful to the user even after a
+    /// cancel.
+    ///
+    /// Lifecycle gotcha: we hide the overlay promptly after the red
+    /// flash plays out (~350 ms), but we must still synchronously
+    /// await `manager.stop()` before restoring production settings —
+    /// otherwise a fast follow-up ⌥Space could read mid-cleanup
+    /// state and bind the wrong `savedOnCompleted` for the next
+    /// session, leaking the cancellation behavior into a real
+    /// recording. While we're inside that await, `manager.isBusy` is
+    /// true so a new `start()` will beep-and-bail, which is the
+    /// desired backpressure.
+    private func cancel() async {
+        guard isDictating else { return }
+        isDictating = false
+        isPaused = false
+
+        silenceTask?.cancel()
+        silenceTask = nil
+        teardownConditionalBindings()
+
+        // Trigger the red ring-pulse on the overlay.
+        cancelFlashAt = Date()
+
+        // Discard whatever the manager has captured — cancel means
+        // throw away. nil-ing the callback before stop() means the
+        // manager's tail-pass completion fires into the void
+        // instead of triggering any session-saver logic.
+        manager.onSessionCompleted = nil
+
+        // Promptly hide the orb after the red flash plays. This
+        // happens in parallel with manager.stop() below; the user
+        // doesn't need to see the orb sit while Whisper finalizes.
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            self?.overlay.hide()
+        }
+
+        await manager.stop()
+
+        manager.onSessionCompleted = savedOnCompleted
+        manager.speakerLabelsEnabled = savedSpeakerLabels
+        manager.noiseFilterLevel = savedNoiseFilter
+        manager.vocabularyHints = savedVocabHints
+        manager.commitThresholds = savedCommitThresholds
+    }
+
+    /// Registers the ⌥P binding on `pauseHotkey`. Logs and continues
+    /// silently if registration fails — pause is a nice-to-have, not
+    /// a critical path, and the global ⌥P collision is the
+    /// realistic failure mode (some other app already owns it).
+    private func installPauseHotkey() {
+        let registered = pauseHotkey.register(
+            keyCode: HotkeyManager.Key.p,
+            modifiers: HotkeyManager.Modifier.option.rawValue
+        ) { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.togglePause()
+            }
+        }
+        if !registered {
+            NSLog("[Humdrum] Pause hotkey ⌥P could not be registered (likely owned by another app).")
+        }
+    }
+
+    /// Installs both a global and a local NSEvent monitor for
+    /// `keyDown` events matching the Escape key. The dictation panel
+    /// is intentionally non-key (so the user's focused text field in
+    /// the target app keeps focus and ⌘V lands correctly), so a
+    /// local monitor alone wouldn't catch keystrokes during a
+    /// typical dictation. Global covers "user is in another app and
+    /// hits escape," local covers the rare case where Humdrum's
+    /// main window happens to be focused. Both are torn down on
+    /// stop/cancel so we're not eavesdropping outside an active
+    /// dictation.
+    private func installEscapeMonitor() {
+        let mask: NSEvent.EventTypeMask = [.keyDown]
+        escapeMonitor = NSEvent.addGlobalMonitorForEvents(matching: mask) { [weak self] event in
+            guard let self, event.keyCode == 53 /* kVK_Escape */ else { return }
+            Task { @MainActor [weak self] in
+                await self?.cancel()
+            }
+        }
+        localEscapeMonitor = NSEvent.addLocalMonitorForEvents(matching: mask) { [weak self] event in
+            guard let self, event.keyCode == 53 else { return event }
+            Task { @MainActor [weak self] in
+                await self?.cancel()
+            }
+            // Swallow the event so it doesn't propagate into our own
+            // window's responder chain.
+            return nil
+        }
+    }
+
+    /// Tears down the pause hotkey and escape monitors. Safe to call
+    /// multiple times (each call is idempotent on already-cleared
+    /// state). Called from both `stop()` and `cancel()`.
+    private func teardownConditionalBindings() {
+        pauseHotkey.unregister()
+        if let escapeMonitor {
+            NSEvent.removeMonitor(escapeMonitor)
+            self.escapeMonitor = nil
+        }
+        if let localEscapeMonitor {
+            NSEvent.removeMonitor(localEscapeMonitor)
+            self.localEscapeMonitor = nil
+        }
+    }
+
     // MARK: - Silence monitor
 
     private func startSilenceMonitor() {
@@ -756,6 +942,14 @@ final class DictationCoordinator: ObservableObject {
     }
 
     private func evaluateAudio() {
+        // Pause is a hard freeze — no silence detection, no phase-1
+        // commits, no no-speech-timeout firing. The orb stays on
+        // screen with `lastSpeechTime` frozen at the moment of pause
+        // (set inside `togglePause()`), so the silence ring renders
+        // at full and reads as "we're holding for you." Tap ⌥P
+        // again to resume.
+        if isPaused { return }
+
         // Compare against the manager's RAW RMS, not the boosted
         // `audioLevels`. The old code averaged the three boosted +
         // smoothed visualizer levels and compared to 0.015 — that
@@ -812,6 +1006,13 @@ final class DictationCoordinator: ObservableObject {
 
     deinit {
         hotkey.unregister()
+        pauseHotkey.unregister()
+        if let escapeMonitor {
+            NSEvent.removeMonitor(escapeMonitor)
+        }
+        if let localEscapeMonitor {
+            NSEvent.removeMonitor(localEscapeMonitor)
+        }
         accessibilityPollTimer?.invalidate()
         if let tccObserver {
             DistributedNotificationCenter.default().removeObserver(tccObserver)

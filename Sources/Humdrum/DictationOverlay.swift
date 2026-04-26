@@ -184,12 +184,16 @@ struct DictationOverlayView: View {
                 // orb's local space), then the wind-down scale, then
                 // opacity. That way the breathing/drift motion shrinks
                 // with the orb during phase 2 instead of bouncing
-                // around its old origin.
+                // around its old origin. The pause dim multiplies on
+                // top of the wind-down opacity so a paused orb still
+                // feels distinctly different from an active one
+                // without changing the geometry.
                 .rotationEffect(tilt)
                 .offset(drift)
                 .scaleEffect(breath)
                 .scaleEffect(scale)
-                .opacity(Double(scale))
+                .opacity(Double(scale) * (dictation.isPaused ? 0.55 : 1.0))
+                .animation(.easeOut(duration: 0.18), value: dictation.isPaused)
             }
             .frame(width: orbSize, height: orbSize)
 
@@ -281,14 +285,16 @@ struct DictationOverlayView: View {
         return CGFloat(1.0 - progress)
     }
 
-    /// Combined chunk-pulse and silence-countdown visuals. Rendered
-    /// inside a TimelineView so both animations are driven entirely
-    /// by the current wall-clock time relative to coordinator events.
+    /// Combined chunk-pulse, silence-countdown, and cancel-flash
+    /// visuals. Rendered inside a TimelineView so all animations are
+    /// driven entirely by the current wall-clock time relative to
+    /// coordinator events.
     @ViewBuilder
     private func indicators(now: Date) -> some View {
         ZStack {
             chunkPulse(now: now)
             silenceCountdown(now: now)
+            cancelFlash(now: now)
         }
     }
 
@@ -315,6 +321,32 @@ struct DictationOverlayView: View {
                     .opacity(1.0 - progress)
                     .blur(radius: 0.8)
                     .shadow(color: AppTheme.accent.opacity(0.7), radius: 10)
+            }
+        }
+    }
+
+    /// Red ring that expands outward when the user hits Escape to
+    /// cancel an active dictation. Fires for ~350 ms — long enough
+    /// to register peripherally as "I cancelled, that's why the orb
+    /// went away" without making the user wait for the orb to
+    /// disappear after they'd already decided to bail. Lives on the
+    /// same TimelineView clock as the other indicators so it
+    /// animates smoothly even though the orb is also wind-down-
+    /// fading at the same moment.
+    @ViewBuilder
+    private func cancelFlash(now: Date) -> some View {
+        if let firedAt = dictation.cancelFlashAt {
+            let age = now.timeIntervalSince(firedAt)
+            let duration: TimeInterval = 0.35
+            if age >= 0, age < duration {
+                let progress = age / duration
+                let scale = 0.96 + CGFloat(progress) * 0.45
+                Circle()
+                    .stroke(AppTheme.danger.opacity(0.95), lineWidth: 3)
+                    .frame(width: orbSize * scale, height: orbSize * scale)
+                    .opacity(1.0 - progress)
+                    .blur(radius: 0.6)
+                    .shadow(color: AppTheme.danger.opacity(0.8), radius: 12)
             }
         }
     }
@@ -506,18 +538,33 @@ private struct ListeningIndicator: View {
     private var fontSize: CGFloat { max(11, orbDiameter * 0.085) }
 
     var body: some View {
-        let visibility = speechVisibility()
-        HStack(alignment: .center, spacing: 1) {
-            Text("Listening")
-                .foregroundStyle(.white.opacity(0.85))
-            ForEach(0..<3, id: \.self) { i in
-                Text(".")
-                    .foregroundStyle(.white.opacity(dotOpacity(i)))
+        Group {
+            if dictation.isPaused {
+                // Paused state: replace the speech-gated listening
+                // indicator with a static "Paused" label so the user
+                // sees a clear "we're holding for you" signal instead
+                // of a dimmed orb that could read as broken. The label
+                // is fully opaque (not subject to speechVisibility)
+                // because paused-but-silent is the entire point.
+                Text("Paused")
+                    .foregroundStyle(.white.opacity(0.9))
+                    .font(.system(size: fontSize, weight: .medium, design: .rounded))
+                    .shadow(color: .black.opacity(0.35), radius: 2, y: 0)
+            } else {
+                let visibility = speechVisibility()
+                HStack(alignment: .center, spacing: 1) {
+                    Text("Listening")
+                        .foregroundStyle(.white.opacity(0.85))
+                    ForEach(0..<3, id: \.self) { i in
+                        Text(".")
+                            .foregroundStyle(.white.opacity(dotOpacity(i)))
+                    }
+                }
+                .font(.system(size: fontSize, weight: .medium, design: .rounded))
+                .shadow(color: .black.opacity(0.35), radius: 2, y: 0)
+                .opacity(visibility)
             }
         }
-        .font(.system(size: fontSize, weight: .medium, design: .rounded))
-        .shadow(color: .black.opacity(0.35), radius: 2, y: 0)
-        .opacity(visibility)
         .frame(width: orbDiameter, height: orbDiameter)
         .allowsHitTesting(false)
     }

@@ -8,13 +8,24 @@ import AppKit
 ///
 /// Default binding: ⌥Space (Option + Space) — same as Whisper Flow /
 /// Superwhisper. Can be rebound at runtime via `register(keyCode:modifiers:)`.
+///
+/// Multiple instances can coexist as long as they're constructed with
+/// different `id`s (Carbon disambiguates registered hotkeys by the
+/// `(signature, id)` pair). The dictation flow uses two: id 1 for the
+/// global ⌥Space toggle, id 2 for the conditional ⌥P pause that's only
+/// armed while the orb is up.
 final class HotkeyManager {
 
     typealias Handler = () -> Void
 
+    private let id: UInt32
     private var hotKeyRef: EventHotKeyRef?
     private var eventHandler: EventHandlerRef?
     private var handler: Handler?
+
+    init(id: UInt32 = 1) {
+        self.id = id
+    }
 
     /// Convenience wrappers for the most common modifier bit masks (from
     /// <Carbon/HIToolbox/Events.h>).
@@ -28,6 +39,7 @@ final class HotkeyManager {
     /// Convenience keyCodes for space + common letters.
     enum Key {
         static let space: UInt32 = UInt32(kVK_Space)         // 49
+        static let p:     UInt32 = UInt32(kVK_ANSI_P)        // 35
     }
 
     /// Registers the given hotkey. Replaces any previously registered
@@ -72,10 +84,12 @@ final class HotkeyManager {
 
         // Register the actual hotkey. Signature is an arbitrary FourCC
         // ("HDRM" = Humdrum) — macOS uses it for disambiguation if
-        // multiple processes register hotkeys.
+        // multiple processes register hotkeys. The numeric `id` lets
+        // *this* process distinguish multiple bindings owned by
+        // different HotkeyManager instances.
         let hotKeyID = EventHotKeyID(
             signature: OSType(0x4844_524D), // "HDRM"
-            id: 1
+            id: id
         )
         var ref: EventHotKeyRef?
         let status = RegisterEventHotKey(
