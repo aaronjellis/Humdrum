@@ -12,12 +12,26 @@ import UniformTypeIdentifiers
 struct SessionDetailView: View {
     @EnvironmentObject var store: SessionStore
     @EnvironmentObject var appState: AppState
+    @EnvironmentObject var corrections: CorrectionsStore
     let session: TranscriptSession
 
     @State private var showCopyConfirmation: Bool = false
     @State private var isEditingTitle: Bool = false
     @State private var draftTitle: String = ""
     @FocusState private var titleFocused: Bool
+
+    // Correction sheet state.
+    //
+    // Tonight's slice: a button in the footer opens this sheet where the
+    // user types what Humdrum heard vs. what they meant. Per-word
+    // double-click lands in a follow-on evening once we decide between
+    // mode-toggle and NSTextViewRepresentable for the per-word
+    // interaction (both compatible with this same data model).
+    @State private var showCorrectionSheet: Bool = false
+    @State private var correctionHeard: String = ""
+    @State private var correctionMeant: String = ""
+    @State private var correctionScope: CorrectionScope = .global
+    @State private var showTeachConfirmation: Bool = false
 
     /// True if the background diarization worker is still processing this
     /// specific session. Independent of the manager — the user can be
@@ -42,6 +56,9 @@ struct SessionDetailView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .sheet(isPresented: $showCorrectionSheet) {
+            correctionSheet
+        }
     }
 
     private var header: some View {
@@ -171,12 +188,140 @@ struct SessionDetailView: View {
                 .keyboardShortcut("s", modifiers: [.command])
                 .help("Save as .txt or .md")
 
+            // Tonight's primary learning-loop entry point. The
+            // gamified onboarding banner ("Want Humdrum to learn how
+            // you speak?") and the per-word double-click flow are
+            // phase α follow-ons that ride on this same record() path.
+            action(title: showTeachConfirmation ? "Saved" : "Teach…",
+                   systemImage: showTeachConfirmation ? "checkmark" : "graduationcap",
+                   run: beginTeach)
+                .help("File a correction so Humdrum gets future transcripts right")
+
+            // Visible badge of how many corrections are already on this
+            // session. Cheap and informative — turns the abstract
+            // "learning" idea into a concrete count the user has been
+            // building up. No-op when zero so we don't clutter.
+            if !sessionCorrections.isEmpty {
+                Text("\(sessionCorrections.count) correction\(sessionCorrections.count == 1 ? "" : "s")")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(AppTheme.textSecondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Capsule().fill(AppTheme.accentSoft))
+                    .overlay(Capsule().stroke(AppTheme.accentBorder, lineWidth: 0.5))
+            }
+
             Spacer()
 
             action(title: "Delete", systemImage: "trash", destructive: true, run: delete)
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 14)
+    }
+
+    /// Corrections filed against this specific session. Drives the
+    /// "N corrections" badge in the footer.
+    private var sessionCorrections: [Correction] {
+        corrections.corrections(for: session.id)
+    }
+
+    // MARK: Correction sheet
+
+    private func beginTeach() {
+        // Pre-populate the "heard" field with whatever the user has
+        // currently selected in the transcript text view, if anything.
+        // SwiftUI doesn't expose a clean "what's selected" hook on
+        // Text(.textSelection(.enabled)), so we read the system
+        // pasteboard's "find" buffer if the user just hit ⌘E, falling
+        // back to empty otherwise. This is good-enough seeding —
+        // worst case the user types both fields manually.
+        let findBoard = NSPasteboard(name: .find)
+        let seeded = findBoard.string(forType: .string) ?? ""
+        correctionHeard = seeded
+        correctionMeant = ""
+        correctionScope = .global
+        showCorrectionSheet = true
+    }
+
+    private func saveCorrection() {
+        let saved = corrections.record(
+            sessionId: session.id,
+            originalText: correctionHeard,
+            correctedText: correctionMeant,
+            scope: correctionScope,
+            source: .teaching
+        )
+        showCorrectionSheet = false
+        guard saved != nil else { return }
+        // Brief footer flash so the user gets feedback that their
+        // correction landed. Same idiom as the Copy button.
+        showTeachConfirmation = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            showTeachConfirmation = false
+        }
+    }
+
+    private var correctionSheet: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("Teach Humdrum")
+                    .font(.system(size: 16, weight: .semibold))
+                Spacer()
+                Image(systemName: "graduationcap")
+                    .foregroundStyle(AppTheme.accent)
+            }
+
+            Text("Tell Humdrum what it should have heard. Saved corrections will be used to bias future transcripts toward the right word.")
+                .font(.system(size: 12))
+                .foregroundStyle(AppTheme.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("What Humdrum heard")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(AppTheme.textTertiary)
+                TextField("e.g. \"see you at the meting\"", text: $correctionHeard, axis: .vertical)
+                    .textFieldStyle(.roundedBorder)
+                    .lineLimit(1...3)
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("What you actually said")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(AppTheme.textTertiary)
+                TextField("e.g. \"see you at the meeting\"", text: $correctionMeant, axis: .vertical)
+                    .textFieldStyle(.roundedBorder)
+                    .lineLimit(1...3)
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Apply this correction to")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(AppTheme.textTertiary)
+                Picker("", selection: $correctionScope) {
+                    ForEach(CorrectionScope.allCases) { scope in
+                        Text(scope.displayName).tag(scope)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+            }
+
+            HStack {
+                Spacer()
+                Button("Cancel") { showCorrectionSheet = false }
+                    .keyboardShortcut(.cancelAction)
+                Button("Save correction", action: saveCorrection)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(
+                        correctionHeard.trimmingCharacters(in: .whitespaces).isEmpty ||
+                        correctionMeant.trimmingCharacters(in: .whitespaces).isEmpty
+                    )
+            }
+            .padding(.top, 4)
+        }
+        .padding(24)
+        .frame(width: 480)
     }
 
     private func action(

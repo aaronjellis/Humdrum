@@ -74,17 +74,40 @@ enum PasteHelper {
     /// verification on the `.inserted` branch).
     @discardableResult
     static func paste(_ text: String) -> PasteResult {
+        let bundleID = frontmostBundleID()
+        let role = focusedAXRole()
+        let hasAX = accessibilityEnabled()
+
+        // Log what the cascade saw — bundle ID and role are metadata,
+        // never the dictated text. Character count is enough to
+        // correlate paste-success vs. paste-failure with payload size.
+        Diagnostics.paste.info(
+            "paste.begin chars=\(text.count) bundle=\(bundleID ?? "?", privacy: .public) role=\(role ?? "?", privacy: .public) ax=\(hasAX, privacy: .public)"
+        )
+
         let decision = PasteCascade.decide(
             text: text,
-            hasAccessibility: accessibilityEnabled(),
-            bundleID: frontmostBundleID(),
-            focusedRole: focusedAXRole()
+            hasAccessibility: hasAX,
+            bundleID: bundleID,
+            focusedRole: role
         )
-        return PasteCascade.execute(
+
+        let started = Date()
+        let result = PasteCascade.execute(
             text: text,
             decision: decision,
             backend: RealPasteBackend()
         )
+        let ms = Int(Date().timeIntervalSince(started) * 1000)
+
+        // The result enum cases vary by HumdrumCore version; log the
+        // string description so we capture whichever branch fired
+        // without binding this file to specific cases. The cascade
+        // module owns the canonical taxonomy.
+        Diagnostics.paste.info(
+            "paste.end ms=\(ms) result=\(String(describing: result), privacy: .public)"
+        )
+        return result
     }
 
     // MARK: - Environment probes
@@ -230,6 +253,7 @@ private struct RealPasteBackend: PasteBackend {
     ///     apps land on in practice.
     func insertViaKeystrokes(_ text: String) -> Bool {
         guard let source = CGEventSource(stateID: .combinedSessionState) else {
+            Diagnostics.paste.error("paste.keystrokes.no_event_source")
             return false
         }
 
@@ -237,6 +261,10 @@ private struct RealPasteBackend: PasteBackend {
         var index = 0
         let chunkSize = 16
         let interChunkDelayUs: useconds_t = 5_000   // 5 ms
+        let chunkCount = (utf16.count + chunkSize - 1) / chunkSize
+        Diagnostics.paste.info(
+            "paste.keystrokes.begin chars=\(text.count) chunks=\(chunkCount)"
+        )
 
         while index < utf16.count {
             let end = min(index + chunkSize, utf16.count)
@@ -251,6 +279,9 @@ private struct RealPasteBackend: PasteBackend {
                 virtualKey: 0,
                 keyDown: false
             ) else {
+                Diagnostics.paste.error(
+                    "paste.keystrokes.cgevent_failed at_index=\(index)"
+                )
                 return false
             }
 
@@ -271,6 +302,7 @@ private struct RealPasteBackend: PasteBackend {
                 usleep(interChunkDelayUs)
             }
         }
+        Diagnostics.paste.info("paste.keystrokes.ok")
         return true
     }
 
@@ -291,7 +323,9 @@ private struct RealPasteBackend: PasteBackend {
     /// can be generous — 3.0s, matching Superwhisper. See the comment
     /// on the actual `asyncAfter` call below for the full reasoning.
     func insertViaClipboard(_ text: String) -> Bool {
+        Diagnostics.paste.info("paste.clipboard.begin chars=\(text.count)")
         guard let source = CGEventSource(stateID: .combinedSessionState) else {
+            Diagnostics.paste.error("paste.clipboard.no_event_source")
             return false
         }
 
@@ -321,6 +355,7 @@ private struct RealPasteBackend: PasteBackend {
               let vDown   = CGEvent(keyboardEventSource: source, virtualKey: 9,    keyDown: true),
               let vUp     = CGEvent(keyboardEventSource: source, virtualKey: 9,    keyDown: false),
               let cmdUp   = CGEvent(keyboardEventSource: source, virtualKey: 0x37, keyDown: false) else {
+            Diagnostics.paste.error("paste.clipboard.cgevent_failed")
             restorePasteboard(pasteboard, snapshot: saved)
             return false
         }
@@ -354,6 +389,7 @@ private struct RealPasteBackend: PasteBackend {
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
             restorePasteboard(pasteboard, snapshot: saved)
         }
+        Diagnostics.paste.info("paste.clipboard.ok")
         return true
     }
 

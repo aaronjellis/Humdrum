@@ -220,6 +220,17 @@ private struct DictationSettingsTab: View {
             } header: {
                 Text("Paste into focused field")
             }
+
+            Section {
+                diagnosticsRow
+            } header: {
+                Text("Diagnostics")
+            } footer: {
+                Text("Logs are local-only — never uploaded. They contain timings, character counts, and outcome flags, but never the transcribed text itself.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .formStyle(.grouped)
         .padding(16)
@@ -228,6 +239,49 @@ private struct DictationSettingsTab: View {
             // the state flip to granted within ~1.5 s of enabling it
             // (silent — no system prompt).
             dictation.refreshAccessibilityStatus()
+        }
+    }
+
+    /// "Reveal Diagnostic Logs" affordance. Console.app doesn't expose
+    /// a URL scheme for pre-filtering on a subsystem, so we do the next
+    /// best thing: copy the subsystem string to the clipboard, then
+    /// launch Console — the user pastes into the search field. Two
+    /// clicks total instead of memorizing `com.aaronellis.humdrum`.
+    @State private var didCopySubsystem: Bool = false
+
+    private var diagnosticsRow: some View {
+        HStack(alignment: .center, spacing: 12) {
+            Image(systemName: "doc.text.magnifyingglass")
+                .font(.title3)
+                .foregroundStyle(AppTheme.accent)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Reveal logs in Console")
+                    .fontWeight(.medium)
+                Text(didCopySubsystem
+                     ? "Subsystem copied — paste into Console's search field."
+                     : "Opens Console.app and copies the Humdrum subsystem to your clipboard so you can filter to just our logs.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+            Button("Open Console…") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(Diagnostics.subsystem, forType: .string)
+                didCopySubsystem = true
+                if let consoleURL = NSWorkspace.shared.urlForApplication(
+                    withBundleIdentifier: "com.apple.Console"
+                ) {
+                    NSWorkspace.shared.open(consoleURL)
+                } else {
+                    NSWorkspace.shared.open(URL(fileURLWithPath: "/System/Applications/Utilities/Console.app"))
+                }
+                // Reset the "copied" hint after a few seconds so the
+                // row doesn't sit in confirmation state forever.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 4) {
+                    didCopySubsystem = false
+                }
+            }
         }
     }
 

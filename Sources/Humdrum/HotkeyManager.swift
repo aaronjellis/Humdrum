@@ -22,6 +22,12 @@ final class HotkeyManager {
     private var hotKeyRef: EventHotKeyRef?
     private var eventHandler: EventHandlerRef?
     private var handler: Handler?
+    /// Optional companion handler invoked on `kEventHotKeyReleased`.
+    /// Used by PTT to detect end-of-hold without resorting to NSEvent
+    /// global monitors, which can't swallow events globally and so leak
+    /// raw ⌥Space keystrokes (= macOS non-breaking-space insertion)
+    /// through to the focused field.
+    private var releaseHandler: Handler?
 
     init(id: UInt32 = 1) {
         self.id = id
@@ -45,40 +51,88 @@ final class HotkeyManager {
     /// Registers the given hotkey. Replaces any previously registered
     /// binding. The handler is invoked on the main thread every time the
     /// key combination fires.
+    ///
+    /// If `onRelease` is provided, the hotkey also generates release
+    /// events (Carbon's `kEventHotKeyReleased`). This is the path PTT
+    /// uses — Carbon swallows BOTH press and release at the OS level, so
+    /// the focused field never sees the raw ⌥Space keystrokes that
+    /// would otherwise insert non-breaking spaces while the user holds
+    /// the combo.
     @discardableResult
     func register(
         keyCode: UInt32,
         modifiers: UInt32,
-        handler: @escaping Handler
+        handler: @escaping Handler,
+        onRelease: Handler? = nil
     ) -> Bool {
         unregister()
         self.handler = handler
+        self.releaseHandler = onRelease
 
-        var eventType = EventTypeSpec(
-            eventClass: OSType(kEventClassKeyboard),
-            eventKind: UInt32(kEventHotKeyPressed)
-        )
+        // When the caller wants release events too, install handlers for
+        // both event kinds. Carbon dispatches each kind to the same
+        // EventHandlerUPP — we disambiguate inside the callback by
+        // reading the event's kind. Keeping a single InstallEventHandler
+        // call (with a count of 2) means we still only have one handler
+        // ref to clean up on unregister.
+        var eventTypes: [EventTypeSpec] = [
+            EventTypeSpec(
+                eventClass: OSType(kEventClassKeyboard),
+                eventKind: UInt32(kEventHotKeyPressed)
+            )
+        ]
+        if onRelease != nil {
+            eventTypes.append(
+                EventTypeSpec(
+                    eventClass: OSType(kEventClassKeyboard),
+                    eventKind: UInt32(kEventHotKeyReleased)
+                )
+            )
+        }
 
         // Install the event handler (only once; we keep a ref so we can
-        // remove it on unregister).
-        let callback: EventHandlerUPP = { _, _, userData in
-            guard let userData else { return noErr }
+        // remove it on unregister). The callback fires on the main
+        // thread for both pressed and released events; we route each
+        // event to the right handler based on its kind.
+        let callback: EventHandlerUPP = { _, eventRef, userData in
+            guard let userData, let eventRef else { return noErr }
             let manager = Unmanaged<HotkeyManager>
                 .fromOpaque(userData)
                 .takeUnretainedValue()
-            DispatchQueue.main.async { manager.handler?() }
+            let kind = GetEventKind(eventRef)
+            DispatchQueue.main.async {
+                if kind == UInt32(kEventHotKeyReleased) {
+                    manager.releaseHandler?()
+                } else {
+                    manager.handler?()
+                }
+            }
             return noErr
         }
 
         var handlerRef: EventHandlerRef?
-        let installStatus = InstallEventHandler(
-            GetApplicationEventTarget(),
-            callback,
-            1,
-            &eventType,
-            Unmanaged.passUnretained(self).toOpaque(),
-            &handlerRef
-        )
+        // `&eventTypes` on a Swift Array does NOT give us the C-array
+        // pointer Carbon expects (it boxes through the inout machinery).
+        // Use withUnsafeBufferPointer to grab the contiguous storage's
+        // base address directly. The pointer is only valid during the
+        // closure call, but InstallEventHandler copies the EventTypeSpec
+        // values internally, so we don't need the storage to outlive
+        // this scope.
+        let installStatus: OSStatus = eventTypes.withUnsafeBufferPointer { buffer in
+            // `inNumTypes` imports as `Int` in current SDKs (older
+            // headers typed it as the Carbon `ItemCount`/UInt32). Pass
+            // `buffer.count` directly — the integer literal `1` worked
+            // in the press-only path because Swift coerces literals,
+            // but a typed UInt32 doesn't get the same coercion.
+            InstallEventHandler(
+                GetApplicationEventTarget(),
+                callback,
+                buffer.count,
+                buffer.baseAddress,
+                Unmanaged.passUnretained(self).toOpaque(),
+                &handlerRef
+            )
+        }
         guard installStatus == noErr, let handlerRef else { return false }
         self.eventHandler = handlerRef
 
@@ -116,6 +170,8 @@ final class HotkeyManager {
             self.hotKeyRef = nil
         }
         removeHandler()
+        handler = nil
+        releaseHandler = nil
     }
 
     private func removeHandler() {

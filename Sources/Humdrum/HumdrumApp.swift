@@ -5,13 +5,20 @@ import AppKit
 struct HumdrumApp: App {
 
     // Shared objects — same instances visible to every window + menu bar.
-    @StateObject private var manager:    TranscriptionManager
-    @StateObject private var store:      SessionStore
-    @StateObject private var appState:   AppState
-    @StateObject private var dictation:  DictationCoordinator
-    @StateObject private var modelCache: ModelCache
-    @StateObject private var onboarding: OnboardingState
-    @StateObject private var updater:    SparkleUpdater
+    @StateObject private var manager:     TranscriptionManager
+    @StateObject private var store:       SessionStore
+    @StateObject private var appState:    AppState
+    @StateObject private var dictation:   DictationCoordinator
+    @StateObject private var modelCache:  ModelCache
+    @StateObject private var onboarding:  OnboardingState
+    @StateObject private var updater:     SparkleUpdater
+    @StateObject private var corrections: CorrectionsStore
+
+    /// Guard against double-registering the wake-from-sleep observer.
+    /// `.task` on the main WindowGroup re-fires whenever the user
+    /// closes and re-opens the window; we only want one wake observer
+    /// for the lifetime of the app.
+    private static var didRegisterWakeObserver: Bool = false
 
     @MainActor
     init() {
@@ -38,13 +45,15 @@ struct HumdrumApp: App {
         let mc = ModelCache()
         let ob = OnboardingState()
         let up = SparkleUpdater()
-        _manager    = StateObject(wrappedValue: m)
-        _store      = StateObject(wrappedValue: s)
-        _appState   = StateObject(wrappedValue: a)
-        _dictation  = StateObject(wrappedValue: d)
-        _modelCache = StateObject(wrappedValue: mc)
-        _onboarding = StateObject(wrappedValue: ob)
-        _updater    = StateObject(wrappedValue: up)
+        let cr = CorrectionsStore()
+        _manager     = StateObject(wrappedValue: m)
+        _store       = StateObject(wrappedValue: s)
+        _appState    = StateObject(wrappedValue: a)
+        _dictation   = StateObject(wrappedValue: d)
+        _modelCache  = StateObject(wrappedValue: mc)
+        _onboarding  = StateObject(wrappedValue: ob)
+        _updater     = StateObject(wrappedValue: up)
+        _corrections = StateObject(wrappedValue: cr)
     }
 
     var body: some Scene {
@@ -71,6 +80,7 @@ struct HumdrumApp: App {
             .environmentObject(modelCache)
             .environmentObject(onboarding)
             .environmentObject(updater)
+            .environmentObject(corrections)
             .frame(minWidth: 900, minHeight: 620)
             .task {
                 appState.wire(manager: manager, store: store)
@@ -80,6 +90,30 @@ struct HumdrumApp: App {
                 manager.onModelLoaded = { [weak modelCache] in
                     modelCache?.refresh()
                 }
+
+                // Wake-from-sleep re-warm. Sleep evicts the Core ML
+                // residency we paid for at launch, so the first
+                // ⌥Space after the user opens their lid pays the
+                // cold-ANE tax all over again. Push a silent buffer
+                // through on wake so the next real press lands warm.
+                // Registered once per app lifetime — `.task` re-fires
+                // when the main window is re-opened, and we don't want
+                // to stack observers.
+                if !Self.didRegisterWakeObserver {
+                    Self.didRegisterWakeObserver = true
+                    NSWorkspace.shared.notificationCenter.addObserver(
+                        forName: NSWorkspace.didWakeNotification,
+                        object: nil,
+                        queue: .main
+                    ) { _ in
+                        Task { @MainActor in
+                            guard manager.modelLoaded, !manager.isRecording else { return }
+                            Diagnostics.engine.info("wake.didWake — re-warming Whisper")
+                            await manager.prewarmInference()
+                        }
+                    }
+                }
+
                 // Pre-warm the Whisper model on launch IF we already
                 // have it on disk. This turns the first ⌥Space into an
                 // instant paste instead of a 2–4 s model-load hang. We

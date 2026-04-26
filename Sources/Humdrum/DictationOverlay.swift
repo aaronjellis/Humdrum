@@ -276,6 +276,16 @@ struct DictationOverlayView: View {
         // animation in `stop()`. There's no phase-2 fade because
         // there's no silence-based commit boundary to fade away from.
         if dictation.sessionActivation == .pushToTalk { return 1.0 }
+        // Paused: hold the orb at full size until the user explicitly
+        // resumes or escapes. `evaluateAudio()` already early-returns
+        // while paused, so no auto-stop is going to fire — but the
+        // wind-down math is anchored on `lastSpeechTime`, which is
+        // frozen at the pause moment. Without this guard wall-clock
+        // time keeps elapsing past `phaseOne` and the orb visibly
+        // shrinks to 0 during a pause, which reads as "did it die?"
+        // even though the engine is still hot. Honor the pause: full
+        // size, no fade.
+        if dictation.isPaused { return 1.0 }
         // Pre-speech window: hold full size; the no-speech timeout
         // fires its own teardown without a visual wind-down.
         guard let last = dictation.lastSpeechTime else { return 1.0 }
@@ -375,6 +385,12 @@ struct DictationOverlayView: View {
     @ViewBuilder
     private func silenceCountdown(now: Date) -> some View {
         if dictation.sessionActivation == .pushToTalk {
+            EmptyView()
+        } else if dictation.isPaused {
+            // Paused: hide the countdown ring entirely. The "Paused"
+            // label inside the orb is the only signal the user needs
+            // — a draining countdown ring would lie about an auto-stop
+            // that won't fire while paused.
             EmptyView()
         } else {
             silenceCountdownToggle(now: now)

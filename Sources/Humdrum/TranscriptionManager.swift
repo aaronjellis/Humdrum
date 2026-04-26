@@ -292,6 +292,9 @@ final class TranscriptionManager: ObservableObject {
         modelLoaded = false
         status = "Preparing “\(qualityLevel.shortLabel)” model… (first run downloads \(qualityLevel.sizeDescription))"
 
+        let loadStart = Date()
+        Diagnostics.engine.info("model.load.begin model=\(targetModel, privacy: .public)")
+
         do {
             let config = WhisperKitConfig(
                 model: targetModel,
@@ -308,14 +311,78 @@ final class TranscriptionManager: ObservableObject {
             }
             self.loadedModelId = targetModel
             self.modelLoaded = true
-            self.status = "Ready (\(qualityLevel.shortLabel)). Click Start to record."
             self.cachedHintText = ""
             self.cachedPromptTokens = nil
             self.onModelLoaded?()
+
+            let loadMs = Int(Date().timeIntervalSince(loadStart) * 1000)
+            Diagnostics.engine.info(
+                "model.load.ok model=\(targetModel, privacy: .public) ms=\(loadMs)"
+            )
+
+            // Exercise the Core ML compute graph with a tiny silent
+            // buffer so the user's first real ⌥Space press doesn't pay
+            // the cold-ANE tax. Without this, the model is nominally
+            // "loaded" but the first transcribe still costs ~1–2 s on a
+            // freshly-launched app while Core ML JITs into the ANE
+            // caches. Status flips to "Warming up" so the user knows
+            // why "Ready" is delayed by another half-second or so.
+            self.status = "Warming up the model…"
+            await self.prewarmInference()
+
+            self.status = "Ready (\(qualityLevel.shortLabel)). Click Start to record."
         } catch {
+            Diagnostics.engine.error(
+                "model.load.failed model=\(targetModel, privacy: .public) err=\(error.localizedDescription, privacy: .public)"
+            )
             self.status = "Model load failed: \(error.localizedDescription)"
         }
         isLoadingModel = false
+    }
+
+    /// Push a tiny silent buffer through WhisperKit so the Core ML
+    /// graph for the encoder/decoder is JIT'd into the ANE caches before
+    /// the user's first real transcribe. Idempotent — safe to call
+    /// repeatedly. Called automatically at the end of `loadModel()` and
+    /// again from `HumdrumApp` on `NSWorkspace.didWakeNotification`,
+    /// because waking from sleep tends to drop ANE residency.
+    ///
+    /// Logs elapsed wall time to `Diagnostics.engine`. No-op when no
+    /// model is loaded or when a recording is in flight (we don't want
+    /// to race a real transcribe). Failures are logged, never surfaced
+    /// to the user — a missed warmup means the next real press is a bit
+    /// slower, not broken.
+    func prewarmInference() async {
+        guard let kit = whisperKit, modelLoaded, !isRecording else { return }
+
+        // 1 second of silence. Whisper's encoder pads to 30 s
+        // internally, so the actual ANE compute is the same regardless
+        // of how short we go — the goal here is just to exercise the
+        // graph once. 1 s is the smallest size where WhisperKit reliably
+        // produces a result without short-circuiting the pipeline.
+        let silentBuffer = [Float](repeating: 0, count: sampleRate)
+        let options = DecodingOptions(
+            task: .transcribe,
+            language: "en",
+            temperature: 0.0,
+            usePrefillPrompt: false,
+            skipSpecialTokens: true,
+            withoutTimestamps: true,
+            suppressBlank: true
+        )
+
+        let start = Date()
+        do {
+            _ = try await kit.transcribe(audioArray: silentBuffer, decodeOptions: options)
+            let ms = Int(Date().timeIntervalSince(start) * 1000)
+            Diagnostics.engine.info(
+                "prewarm.inference.ok model=\(self.loadedModelId ?? "?", privacy: .public) ms=\(ms)"
+            )
+        } catch {
+            Diagnostics.engine.error(
+                "prewarm.inference.failed model=\(self.loadedModelId ?? "?", privacy: .public) err=\(error.localizedDescription, privacy: .public)"
+            )
+        }
     }
 
     // MARK: Recording lifecycle

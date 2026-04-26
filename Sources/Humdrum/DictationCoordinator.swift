@@ -485,8 +485,13 @@ final class DictationCoordinator: ObservableObject {
     // MARK: - Start
 
     private func start(activation: DictationActivationMode) async {
+        Diagnostics.dictation.info(
+            "session.start.requested mode=\(activation.rawValue, privacy: .public) busy=\(self.manager.isBusy, privacy: .public) modelLoaded=\(self.manager.modelLoaded, privacy: .public)"
+        )
+
         // Don't piggy-back on a meeting recording.
         guard !manager.isBusy else {
+            Diagnostics.dictation.notice("session.start.refused reason=manager_busy")
             NSSound.beep()
             return
         }
@@ -494,7 +499,13 @@ final class DictationCoordinator: ObservableObject {
         // Re-check Accessibility; show prompt if needed. The system
         // prompt only fires the first time — subsequent starts just
         // read the current TCC decision.
+        let prevAccessibility = accessibilityGranted
         accessibilityGranted = PasteHelper.accessibilityEnabled(prompt: true)
+        if accessibilityGranted != prevAccessibility {
+            Diagnostics.permissions.info(
+                "accessibility.changed granted=\(self.accessibilityGranted, privacy: .public)"
+            )
+        }
 
         // If the user still isn't granted (either they ignored the
         // system prompt, or this app's TCC row is stale after a
@@ -537,6 +548,7 @@ final class DictationCoordinator: ObservableObject {
         }
         guard manager.modelLoaded else {
             // Load failed — drop the overlay and bail.
+            Diagnostics.dictation.error("session.start.aborted reason=model_load_failed")
             isDictating = false
             overlay.hide()
             return
@@ -584,6 +596,10 @@ final class DictationCoordinator: ObservableObject {
         // beep. The user sees the manager's status string in the main
         // window next time they open it.
         if !manager.isRecording {
+            let micAuth = AVCaptureDevice.authorizationStatus(for: .audio)
+            Diagnostics.dictation.error(
+                "session.start.aborted reason=manager_not_recording micAuth=\(micAuth.rawValue, privacy: .public)"
+            )
             isDictating = false
             silenceTask?.cancel()
             silenceTask = nil
@@ -613,6 +629,7 @@ final class DictationCoordinator: ObservableObject {
         // leaving an orb dangling for the no-speech timeout to catch
         // 8 seconds later.
         if sessionActivation == .pushToTalk, !pttPressActive {
+            Diagnostics.dictation.info("session.start.aborted reason=ptt_released_during_load")
             await stop(reason: .release)
             return
         }
@@ -626,6 +643,10 @@ final class DictationCoordinator: ObservableObject {
             installPauseHotkey()
             installEscapeMonitor()
         }
+
+        Diagnostics.dictation.info(
+            "session.start.ok mode=\(activation.rawValue, privacy: .public) ax=\(self.accessibilityGranted, privacy: .public)"
+        )
     }
 
     // MARK: - Stop
@@ -645,6 +666,10 @@ final class DictationCoordinator: ObservableObject {
 
     private func stop(reason: StopReason) async {
         guard isDictating else { return }
+        let stopStart = Date()
+        Diagnostics.dictation.info(
+            "session.stop.requested reason=\(String(describing: reason), privacy: .public) pastedSoFar=\(self.pastedCharCount, privacy: .public)"
+        )
         isDictating = false
         isPaused = false
 
@@ -712,6 +737,10 @@ final class DictationCoordinator: ObservableObject {
             pendingTail = String(rawText[startIdx...])
         }
         let finalText = pendingTail.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        Diagnostics.dictation.info(
+            "session.stop.flush snapshotChars=\(rawText.count, privacy: .public) tailChars=\(finalText.count, privacy: .public)"
+        )
 
         if finalText.isEmpty {
             // User hit ⌥Space twice with nothing said, or speech
@@ -784,6 +813,11 @@ final class DictationCoordinator: ObservableObject {
         manager.noiseFilterLevel = savedNoiseFilter
         manager.vocabularyHints = savedVocabHints
         manager.commitThresholds = savedCommitThresholds
+
+        let elapsedMs = Int(Date().timeIntervalSince(stopStart) * 1000)
+        Diagnostics.dictation.info(
+            "session.stop.ok reason=\(String(describing: reason), privacy: .public) outcome=\(String(describing: self.pasteOutcome), privacy: .public) tailChars=\(finalText.count, privacy: .public) ms=\(elapsedMs, privacy: .public)"
+        )
 
         // Outcome-dependent orb linger.
         //
@@ -905,6 +939,9 @@ final class DictationCoordinator: ObservableObject {
             refreshAccessibilityStatus()
             pastedCharCount = snapshotCount
         }
+        Diagnostics.dictation.info(
+            "phase1.commit.done chars=\(trimmed.count, privacy: .public) outcome=\(String(describing: self.pasteOutcome), privacy: .public)"
+        )
 
         // Failure-path clipboard preservation, mirroring `stop()`.
         // Cancel any in-flight preservation Task from a previous
@@ -971,11 +1008,21 @@ final class DictationCoordinator: ObservableObject {
     /// desired backpressure.
     private func cancel() async {
         guard isDictating else { return }
+        Diagnostics.dictation.info(
+            "session.cancelled pastedSoFar=\(self.pastedCharCount, privacy: .public)"
+        )
         isDictating = false
         isPaused = false
 
         silenceTask?.cancel()
         silenceTask = nil
+        // Cancel any in-flight clipboard-preservation task from a prior
+        // failed phase-1 commit. Without this, that task could fire
+        // +3.5 s into the next dictation and overwrite whatever
+        // clipboard state the new session has set, causing the new
+        // dictation's paste to land stale text.
+        clipboardPreservationTask?.cancel()
+        clipboardPreservationTask = nil
         teardownConditionalBindings()
 
         // Trigger the red ring-pulse on the overlay.
@@ -1103,6 +1150,9 @@ final class DictationCoordinator: ObservableObject {
         guard let start = sessionStartedAt else { return }
         if lastSpeechTime == nil,
            Date().timeIntervalSince(start) >= noSpeechTimeoutSeconds {
+            Diagnostics.dictation.info(
+                "session.timeout fired=noSpeech budgetSec=\(self.noSpeechTimeoutSeconds, privacy: .public)"
+            )
             Task { await self.stop(reason: .noSpeechTimeout) }
             return
         }
@@ -1139,6 +1189,9 @@ final class DictationCoordinator: ObservableObject {
         let silenceElapsed = Date().timeIntervalSince(last)
 
         if silenceElapsed >= silenceTimeoutSeconds * 2 {
+            Diagnostics.dictation.info(
+                "session.timeout fired=silence elapsedSec=\(silenceElapsed, privacy: .public) budgetSec=\(self.silenceTimeoutSeconds * 2, privacy: .public)"
+            )
             Task { await self.stop(reason: .silenceTimeout) }
             return
         }
@@ -1146,6 +1199,9 @@ final class DictationCoordinator: ObservableObject {
         if silenceElapsed >= silenceTimeoutSeconds,
            !commitInProgress,
            manager.confirmedText.count > pastedCharCount {
+            Diagnostics.dictation.info(
+                "phase1.commit.fire elapsedSec=\(silenceElapsed, privacy: .public) confirmedChars=\(self.manager.confirmedText.count, privacy: .public) pastedSoFar=\(self.pastedCharCount, privacy: .public)"
+            )
             Task { await self.commitAndPaste() }
         }
     }
