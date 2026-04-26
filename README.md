@@ -75,20 +75,40 @@ xcrun notarytool store-credentials humdrum-notary \
 
 - `AudioProcessor` (from WhisperKit) captures microphone audio into a rolling `[Float]` buffer at 16 kHz.
 - Every ~1.5 s we transcribe the portion since the last *commit point* and show it as a "live hypothesis" (italic gray).
-- When the window grows past ~18 s **or** we detect ~1.3 s of tail silence, we commit: append the hypothesis to the confirmed transcript and move the commit point forward.
+- When the rolling window passes the configured `maxSegmentSeconds` **or** we detect tail silence longer than `tailSilenceSeconds`, we commit: append the hypothesis to the confirmed transcript and move the commit point forward. Meeting mode (12 s / 1.3 s) and dictation mode (7 s / 0.5 s) use different thresholds; see `CommitThresholds` in `TranscriptionManager.swift`.
 - If the commit was triggered by a long silence and speaker labeling is on, we toggle `Speaker 1` / `Speaker 2`.
 
 This is a pragmatic streaming scheme: latency is bounded by the transcription interval (~1.5 s) and the commit window. Accuracy is close to batch mode because each commit always has full sentence context.
 
 ## Dictation (⌥Space)
 
-`DictationCoordinator.swift` wraps the same transcription pipeline for a "paste as you speak" flow:
+`DictationCoordinator.swift` wraps the same transcription pipeline for a "paste as you speak" flow. A floating glass-orb visualizer appears on activation, the mic starts listening, and whichever field had focus in the frontmost app keeps focus — the orb's `NSPanel` is `nonactivatingPanel`, so it never steals key window status.
 
-1. ⌥Space → a floating glass-orb visualizer appears, the mic starts listening, and whichever field had focus in the frontmost app keeps focus (the orb's NSPanel is non-activating).
-2. As Whisper commits chunks, `PasteHelper` inserts them into the focused field — first via the Accessibility API (`kAXSelectedTextAttribute`), falling back to synthesized ⌘V through the HID event tap when AX insertion isn't supported.
-3. 2.5 s of silence (configurable in Settings) or another ⌥Space stops dictation and hides the orb.
+### Activation modes
 
-If Accessibility permission is missing, the orb still runs but each chunk only lands on the clipboard — a red warning pill appears under the orb so the failure mode isn't silent.
+Settings → Dictation → **Activation** picks one:
+
+- **Toggle** (default) — Tap ⌥Space to start, tap again to stop. Phrases get pasted as you pause: ~0.5 s of trailing silence triggers a "phase-1 commit" that pastes the new tail into the focused field, and the engine keeps listening until you tap to stop or stay silent for the full silence-timeout (default 6 s).
+- **Push-to-talk** — Hold ⌥Space while you speak, release to commit. The entire utterance is pasted as one chunk on release. No mid-hold pastes — PTT is for the "I want to say one thing and have it land" flow.
+
+Both modes share a Carbon hotkey registration on ⌥Space, so the OS routes the keystroke to Humdrum instead of inserting a non-breaking space into the focused field. Toggle additionally registers ⌥P (pause) and Escape (cancel) while the orb is up.
+
+### Paste cascade
+
+`PasteHelper` + `HumdrumCore.PasteCascade` route every paste through a two-stage strategy:
+
+1. **Clipboard + ⌘V** (primary) — write text to `NSPasteboard`, synthesize ⌘V through the HID event tap, restore the previous clipboard contents 3.0 s later. ⌘V is the single OS-blessed paste event that every mainstream target accepts (Chrome, Electron, Office, JetBrains, Safari, Terminal). Matches what Superwhisper and Wispr Flow default to.
+2. **Synthetic Unicode keystrokes** (fallback) — only reached when stage 1 can't construct a `CGEventSource` (rare). Retained for the handful of apps where ⌘V is rebound (vim in a terminal, niche security tools).
+
+AX `kAXSelectedTextAttribute` writes were considered and dropped: too many target apps (Chromium-family browsers, Electron, Office, JetBrains) report `.success` while silently dropping the write, which would leave the user with no signal that paste failed.
+
+The coordinator does a cheap post-paste AX read of the focused element's character count to detect "the cascade reported success but the receiving app dropped it" — a known failure mode for Electron renderers. When it triggers, a `silentDrop` failure pill tells the user the text is on their clipboard for a manual ⌘V.
+
+### Pause / cancel / failure feedback
+
+- **⌥P** — Pause (toggle mode only). Engine stays hot, orb dims, no auto-stop fires while paused. Tap again to resume.
+- **Escape** — Cancel (toggle mode only). Orb flashes red and tears down without pasting whatever new tail accumulated since the last commit.
+- **Failure pill** — Below the orb. Surfaces missing Accessibility, paste failure (empty clipboard fallback), silent drop (Electron-style consume-but-drop), or a transient "Transcribing…" indicator while the tail Whisper pass runs after a long PTT release.
 
 ## Quality levels
 
@@ -125,6 +145,12 @@ Delay on Stop is roughly 2–6 s per minute of audio on Apple Silicon. First eve
 
 Settings → Transcripts lets you pick a default folder and format, and toggle **Save to default folder automatically**. When that toggle is on, finished recordings are written to the folder immediately — no Save dialog — with filename collisions resolved by appending `-1`, `-2`, etc. The in-app session still exists, so Save… from the detail view remains available.
 
+## Updates
+
+Humdrum self-updates via [Sparkle 2](https://sparkle-project.org). `SparkleUpdater.swift` wraps `SPUStandardUpdaterController` against the appcast URL in `Info.plist`'s `SUFeedURL` (currently a GitHub Pages-hosted feed). The updater fires a quiet background check ~5 s after launch and on a daily schedule; **App menu → Check for Updates…** triggers a user-facing check.
+
+Each downloaded update is verified against the ed25519 public key in `Info.plist` (`SUPublicEDKey`); the matching private key signs releases in CI ([.github/workflows/release.yml](.github/workflows/release.yml)). Pushing a `vX.Y.Z` tag to `main` triggers the full pipeline: build → Developer-ID sign → Apple notarize → staple → Sparkle-sign zip → publish GitHub Release → update appcast on `gh-pages`. End-to-end runbook for one-time setup (keys, secrets, Pages, smoke test) lives in [Docs/SPARKLE_SETUP.md](Docs/SPARKLE_SETUP.md).
+
 ## Known limitations
 
 - **Microphone only.** Capturing system audio (e.g., Zoom's far-side audio) needs a virtual audio driver like [BlackHole](https://github.com/ExistentialAudio/BlackHole) or a multi-output device. You then select that device as your system mic before starting. The app itself needs no change.
@@ -134,7 +160,9 @@ Settings → Transcripts lets you pick a default folder and format, and toggle *
 
 ## Keyboard shortcuts
 
-- `⌥Space` — Start / stop dictation (global)
+- `⌥Space` — Toggle dictation, or hold for push-to-talk (mode picked in Settings → Dictation). Global.
+- `⌥P` — Pause an in-flight toggle-mode dictation (engine stays hot, no auto-stop). Tap again to resume.
+- `Escape` — Cancel an in-flight toggle-mode dictation without pasting the unflushed tail.
 - `⌘R` — Start / stop recording (in-app)
 - `⌘⇧C` — Copy transcript
 - `⌘S` — Save transcript
@@ -143,25 +171,50 @@ Settings → Transcripts lets you pick a default folder and format, and toggle *
 
 ```
 Humdrum/
-├── Package.swift                               Swift package, depends on WhisperKit + FluidAudio
-├── Info.plist                                  Bundle metadata + mic permission copy
+├── Package.swift                               Swift package; depends on WhisperKit + FluidAudio + Sparkle
+├── Info.plist                                  Bundle metadata, mic copy, Sparkle keys
 ├── Humdrum.entitlements                        Hardened-runtime + mic entitlements
 ├── build-app.sh                                Builds, signs, notarizes, staples, zips
+├── .github/workflows/release.yml               Tag → build → notarize → publish + appcast
+├── Docs/SPARKLE_SETUP.md                       One-time release-pipeline runbook
 ├── README.md
+├── Sources/HumdrumCore/                        Pure-logic library, no AppKit / AVFoundation
+│   ├── PasteCascade.swift                      Clipboard-first → keystroke fallback strategy
+│   ├── DictationActivationMode.swift           toggle vs. pushToTalk enum
+│   ├── NoiseFilterLevel.swift                  Off / Light / Normal / Strict thresholds
+│   ├── NoiseSanitizer.swift                    Whisper-hallucination filter ("Thanks for watching")
+│   ├── FuzzyMatcher.swift                      Token-level diff for the corrections-store learning loop
+│   ├── TextChunker.swift                       Default chunk size for the dictation paste path
+│   ├── TranscriptDelta.swift                   Diff-paste utilities
+│   └── WordStream.swift                        Per-session word IDs for ticker animations
 └── Sources/Humdrum/
-    ├── HumdrumApp.swift                        @main entry, window setup
+    ├── HumdrumApp.swift                        @main entry, window setup, wake re-warm
     ├── AppState.swift                          Shared state, auto-save, diarization worker
+    ├── AppMark.swift, Theme.swift              App-icon / palette tokens
     ├── ContentView.swift                       Main SwiftUI window
-    ├── DictationCoordinator.swift              ⌥Space dictation orchestration
-    ├── DictationOverlay.swift                  Floating non-activating orb panel
+    ├── Sidebar.swift, RecordingView.swift,
+    │   RecorderWidget.swift                    Main-window UI
+    ├── DictationCoordinator.swift              ⌥Space session lifecycle, race guards, paste orchestration
+    ├── DictationOverlay.swift                  Floating non-activating orb panel + status pill
     ├── AudioVisualizer.swift                   Glass-sphere visualizer
-    ├── PasteHelper.swift                       AX-insert / ⌘V paste strategies
+    ├── HotkeyManager.swift                     Carbon RegisterEventHotKey wrapper (press + release)
+    ├── PushToTalkMonitor.swift                 PTT press/release driven by Carbon hotkey on ⌥Space
+    ├── PasteHelper.swift                       AX probes, frontmost-app metadata, real paste backend
+    ├── Diagnostics.swift                       Per-subsystem os.log channels
+    ├── CorrectionsStore.swift                  Persisted user-corrections for the learning loop
+    ├── SessionStore.swift                      Persisted transcript store
+    ├── SessionDetailView.swift                 Session view + corrections capture UI
+    ├── ModelCache.swift, BundledModels.swift   Whisper model resolution + warmup
+    ├── DiarizationService.swift                FluidAudio post-stop speaker pass
+    ├── TranscriptExporter.swift                Shared save logic (.txt/.md/.rtf/.json)
+    ├── SetupWindow.swift, OnboardingState.swift,
+    │   OnboardingWindow.swift                  First-launch flow
     ├── MoveToApplications.swift                First-launch move prompt
     ├── UserDefaultsMigrator.swift              Legacy "MeetingScribe.*" key migration
-    ├── TranscriptExporter.swift                Shared save logic (.txt/.md/.rtf/.json)
-    ├── SessionStore.swift                      Persisted transcript store
-    ├── SettingsView.swift                      ⌘, Settings window
-    └── TranscriptionManager.swift              Audio capture + streaming transcription
+    ├── SettingsView.swift                      ⌘, Settings window (incl. Diagnostics row)
+    ├── SparkleUpdater.swift                    Sparkle 2 wrapper + menu binding
+    ├── WindowID.swift                          SceneStorage scene IDs
+    └── TranscriptionManager.swift              Audio capture, streaming transcription, finalize
 ```
 
 ## Troubleshooting

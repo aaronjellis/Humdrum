@@ -101,9 +101,25 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # `--generate-notes` builds the body from PRs and commits
+          # since the previous tag (or from repo start on the first
+          # release). No manual changelog upkeep — and the same body
+          # gets surfaced on Sparkle's update sheet via the appcast
+          # `<description>` we inject below.
           gh release create "$GITHUB_REF_NAME" Humdrum.zip \
             --title "Humdrum $GITHUB_REF_NAME" \
-            --notes "Auto-generated release. See appcast.xml for update details."
+            --generate-notes
+
+      - name: Fetch generated release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Pull the body GitHub just generated so the Sparkle update
+          # sheet shows the same notes the GH release page shows. We
+          # write it to a file rather than an env var because release
+          # bodies routinely exceed GITHUB_ENV's per-line size budget.
+          gh release view "$GITHUB_REF_NAME" --json body -q .body > /tmp/release_notes.md
+          echo "Notes length: $(wc -c < /tmp/release_notes.md) bytes"
 
       - name: Checkout gh-pages
         uses: actions/checkout@v4
@@ -133,6 +149,53 @@ jobs:
           EOF
           fi
 
+          # Read the auto-generated release notes; render the markdown
+          # to HTML so Sparkle's update sheet displays formatting
+          # rather than raw `## headings`. Empty file → empty body,
+          # which is fine — Sparkle just shows "no release notes."
+          NOTES_HTML=$(python3 - <<'PYRENDER'
+          import sys, html, re
+          try:
+              with open('/tmp/release_notes.md') as f:
+                  md = f.read()
+          except FileNotFoundError:
+              md = ''
+          # Minimal markdown → HTML. GitHub auto-notes are simple
+          # (## headings + bullet lists + PR links), so we don't need
+          # a full markdown parser — keep this dependency-free.
+          lines = []
+          in_list = False
+          for raw in md.splitlines():
+              line = raw.rstrip()
+              if line.startswith('## '):
+                  if in_list:
+                      lines.append('</ul>'); in_list = False
+                  lines.append(f'<h3>{html.escape(line[3:])}</h3>')
+              elif line.startswith('* ') or line.startswith('- '):
+                  if not in_list:
+                      lines.append('<ul>'); in_list = True
+                  text = html.escape(line[2:])
+                  # Re-link bare PR URLs that GH inserts.
+                  text = re.sub(
+                      r'(https?://\S+)',
+                      lambda m: f'<a href="{m.group(1)}">{m.group(1)}</a>',
+                      text,
+                  )
+                  lines.append(f'  <li>{text}</li>')
+              elif not line:
+                  if in_list:
+                      lines.append('</ul>'); in_list = False
+              else:
+                  if in_list:
+                      lines.append('</ul>'); in_list = False
+                  lines.append(f'<p>{html.escape(line)}</p>')
+          if in_list:
+              lines.append('</ul>')
+          sys.stdout.write('\n'.join(lines))
+          PYRENDER
+          )
+          export NOTES_HTML
+
           python3 <<PY
           import xml.etree.ElementTree as ET
           import re, os
@@ -147,6 +210,16 @@ jobs:
           ET.SubElement(item, '{http://www.andymatuschak.org/xml-namespaces/sparkle}version').text = "${BUILD_VERSION}"
           ET.SubElement(item, '{http://www.andymatuschak.org/xml-namespaces/sparkle}shortVersionString').text = "${SHORT_VERSION}"
 
+          # <description> drives the body of Sparkle's update sheet.
+          # ElementTree doesn't have a native CDATA writer, so we set
+          # a sentinel and post-process; without CDATA the HTML tags
+          # would be entity-escaped and Sparkle would render the raw
+          # tags as text instead of styled output.
+          notes_html = os.environ.get('NOTES_HTML', '').strip()
+          if notes_html:
+              desc = ET.SubElement(item, 'description')
+              desc.text = '__CDATA_OPEN__' + notes_html + '__CDATA_CLOSE__'
+
           sig_line = os.environ['SPARKLE_SIG'].strip()
           attrs = dict(re.findall(r'(\w+(?::\w+)?)="([^"]+)"', sig_line))
           attrs['url'] = "${DOWNLOAD_URL}"
@@ -156,6 +229,29 @@ jobs:
 
           channel.insert(0, item)   # newest release first
           tree.write('appcast.xml', encoding='utf-8', xml_declaration=True)
+
+          # Swap the sentinels for real CDATA delimiters. ElementTree
+          # entity-escapes everything inside .text, so the sentinel
+          # survives serialization as `__CDATA_OPEN__` literal text;
+          # we replace post-hoc to land actual `<![CDATA[ ... ]]>`.
+          with open('appcast.xml', 'r', encoding='utf-8') as f:
+              xml = f.read()
+          xml = xml.replace('__CDATA_OPEN__', '<![CDATA[').replace('__CDATA_CLOSE__', ']]>')
+          # ET escapes the angle brackets of our HTML inside .text;
+          # undo that within the description blocks only.
+          xml = re.sub(
+              r'(<description>)(.*?)(</description>)',
+              lambda m: m.group(1) + (
+                  m.group(2)
+                  .replace('&lt;', '<')
+                  .replace('&gt;', '>')
+                  .replace('&amp;', '&')
+              ) + m.group(3),
+              xml,
+              flags=re.DOTALL,
+          )
+          with open('appcast.xml', 'w', encoding='utf-8') as f:
+              f.write(xml)
           PY
 
           git config user.name  "github-actions[bot]"
