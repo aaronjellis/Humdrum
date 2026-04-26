@@ -10,10 +10,11 @@ import AppKit
 /// Panels:
 ///   1. welcome       — who I am, one sentence of what I do
 ///   2. features      — explain the two modes (Meeting / Mutter)
-///   3. voiceModel    — pick a Quality, optionally download now
-///   4. permissions   — mic + Accessibility, soft-blocking
-///   5. folder        — optional default save folder (turns auto-save on)
-///   6. success       — checkmark over the animated orb
+///   3. activation    — pick toggle vs press-and-hold for Mutter
+///   4. voiceModel    — pick a Quality, optionally download now
+///   5. permissions   — mic + Accessibility, soft-blocking
+///   6. folder        — optional default save folder (turns auto-save on)
+///   7. success       — checkmark over the animated orb
 ///
 /// Persists a single flag (`Humdrum.onboarded.v1`) — nothing else. All
 /// other state (Quality, save folder, auto-save) is written straight to
@@ -26,7 +27,7 @@ final class OnboardingState: ObservableObject {
     // MARK: - Panels
 
     enum Panel: Int, CaseIterable {
-        case welcome, features, voiceModel, permissions, folder, success
+        case welcome, features, activation, voiceModel, permissions, folder, success
     }
 
     // MARK: - Published

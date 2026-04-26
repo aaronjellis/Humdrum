@@ -271,6 +271,11 @@ struct DictationOverlayView: View {
     /// only actually disappears when `stop()` runs (at 2T on the
     /// silence path, or immediately on hotkey).
     private func windDownScale(now: Date) -> CGFloat {
+        // PTT mode: the orb stays at full size for the entire hold.
+        // Release teardown handles the disappearance via the linger
+        // animation in `stop()`. There's no phase-2 fade because
+        // there's no silence-based commit boundary to fade away from.
+        if dictation.sessionActivation == .pushToTalk { return 1.0 }
         // Pre-speech window: hold full size; the no-speech timeout
         // fires its own teardown without a visual wind-down.
         guard let last = dictation.lastSpeechTime else { return 1.0 }
@@ -362,8 +367,22 @@ struct DictationOverlayView: View {
     ///
     /// A small 0.4 s grace period at the top prevents the ring from
     /// flickering on natural inter-word pauses.
+    ///
+    /// In PTT mode there's no countdown: release of ⌥ or Space is the
+    /// only commit signal, so the ring would only ever drain on the
+    /// no-speech-yet anchor and otherwise sit invisible. Hide it
+    /// outright — the user's fingers are the timer.
     @ViewBuilder
     private func silenceCountdown(now: Date) -> some View {
+        if dictation.sessionActivation == .pushToTalk {
+            EmptyView()
+        } else {
+            silenceCountdownToggle(now: now)
+        }
+    }
+
+    @ViewBuilder
+    private func silenceCountdownToggle(now: Date) -> some View {
         let grace: TimeInterval = 0.4
         let (anchor, total) = countdownAnchor()
 

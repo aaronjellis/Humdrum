@@ -91,6 +91,24 @@ For each target app: focus a text field, press ⌥Space, read the test phrase al
 | Escape immediately after a phase-1 commit | The text that already pasted stays pasted; nothing else fires; no zombie orb | | |
 | Press ⌥Space immediately after Escape | New session starts cleanly with a fresh `savedOnCompleted` (no leakage of cancellation behavior into the next recording) | | |
 
+## Push-to-talk activation (⌥Space hold-to-dictate)
+
+Switch to PTT mode in Settings → Dictation → Activation: pick "Press and hold." All cells below should be repeated against TextEdit (AX target) and one Electron target (Slack or Discord) at minimum.
+
+| Scenario | Pass criteria | Last checked | Notes |
+|---|---|---|---|
+| Hold ⌥+Space, speak short phrase, release | Orb appears on press, stays at full size while held (no countdown ring drain, no scale-down), commits the phrase on release with a single ⌘V | | |
+| Hold ⌥+Space, speak long paragraph, release | All text lands in one paste at release; no mid-utterance phase-1 commits | | |
+| Hold ⌥+Space, say nothing for 8s, release | No-speech timeout fires before release: orb fades; on release nothing additional happens | | |
+| Hold ⌥+Space, pause 5s mid-utterance, keep speaking, release | Silence does NOT trigger commit or teardown; orb stays at full size; final paste on release contains the entire utterance | | |
+| Tap ⌥+Space too fast (release during model load) | Orb disappears immediately on release; no zombie 8s no-speech wait | | |
+| Hold ⌥+Space, release ⌥ first (still holding Space) | Treated as release: commits and tears down | | |
+| Hold ⌥+Space, release Space first (still holding ⌥) | Same as above: commits and tears down | | |
+| Switch from PTT → Toggle in Settings mid-idle | Next ⌥Space tap behaves as toggle; PTT NSEvent monitor torn down | | |
+| Switch from Toggle → PTT in Settings mid-idle | Next ⌥Space hold behaves as PTT; Carbon hotkey torn down | | |
+| Onboarding activation panel — pick PTT | Setting persists; first dictation after finishing onboarding uses press-and-hold | | |
+| Silence-detection slider hidden in Settings while PTT mode | Slider section absent; flipping to Toggle reveals it again | | |
+
 ## Mutter (⌥Space) paste matrix — legacy app coverage
 
 The matrix below was authored for the per-commit paste era. Apps grouped by what we expected the paste cascade to do at the time. Still useful as a coverage checklist: every app that pasted correctly under the old cadence should also paste correctly under commit-once. Treat the AX-first / keystroke split as historical context — under commit-once everything routes clipboard-first.
@@ -158,6 +176,7 @@ Fresh install or `defaults delete com.aaronellis.humdrum Humdrum.onboarded.v1` t
 |---|---|---|
 | Welcome | Orb breathes; waving hand animates | |
 | Features | Two cards explain Meeting Recorder + Mutter | |
+| Activation | Two cards offer "Tap to listen" / "Press and hold"; selecting one tints + checks it; choice persists into Settings | |
 | Voice model | Download kicks off on "Download and continue" | |
 | Permissions | Granting each flips the row green within ~1s | |
 | Folder | Choosing a folder enables auto-save | |

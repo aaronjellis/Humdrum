@@ -112,19 +112,48 @@ final class DictationCoordinator: ObservableObject {
     @Published private(set) var sessionStartedAt: Date?
 
     /// Master switch controlled from Settings. When false, the global
-    /// hotkey is unregistered entirely and dictation can't be triggered.
-    /// Persisted in UserDefaults so it survives launches.
+    /// activation surface is uninstalled entirely and dictation can't
+    /// be triggered. Persisted in UserDefaults so it survives launches.
     @Published var hotkeyEnabled: Bool {
         didSet {
             UserDefaults.standard.set(hotkeyEnabled, forKey: Self.hotkeyEnabledKey)
-            applyHotkeyRegistration()
+            applyActivation()
         }
     }
+
+    /// Whether ⌥Space is a tap-to-toggle binding or a press-and-hold
+    /// PTT binding. Persisted via UserDefaults under the raw enum
+    /// string. Changing this re-installs the activation surface
+    /// immediately — toggle drops the Carbon hotkey and installs the
+    /// PTT NSEvent monitors, or vice versa.
+    ///
+    /// Note: `activationMode` only affects how *new* sessions start.
+    /// A session already in flight uses `sessionActivation`, captured
+    /// at start, so flipping the mode mid-recording (e.g. via Settings)
+    /// doesn't reshape contracts on a live session.
+    @Published var activationMode: DictationActivationMode {
+        didSet {
+            UserDefaults.standard.set(
+                activationMode.rawValue,
+                forKey: Self.activationModeKey
+            )
+            applyActivation()
+        }
+    }
+
+    /// The activation mode of the *currently running* dictation
+    /// session. Captured inside `start()` and used by `evaluateAudio()`
+    /// and the conditional-binding helpers to decide which silence /
+    /// commit behavior applies. Defaults to `.toggle` between sessions
+    /// (it's a session-local snapshot, not user-facing config — the
+    /// public truth is `activationMode`).
+    @Published private(set) var sessionActivation: DictationActivationMode = .toggle
 
     // MARK: - Persisted keys
 
     private static let hotkeyEnabledKey = "Humdrum.dictation.hotkeyEnabled"
     private static let silenceTimeoutKey = "Humdrum.dictation.silenceTimeout"
+    private static let activationModeKey = "Humdrum.dictation.activationMode"
 
     // MARK: - Config
 
@@ -159,6 +188,20 @@ final class DictationCoordinator: ObservableObject {
     /// resume. Lives on its own HotkeyManager instance (id: 2) so it
     /// doesn't collide with the global ⌥Space toggle (id: 1).
     private let pauseHotkey = HotkeyManager(id: 2)
+
+    /// PTT activation surface, used in place of `hotkey` when the
+    /// user has set `activationMode = .pushToTalk`. Only one of
+    /// `hotkey` / `pttMonitor` is installed at a time; see
+    /// `applyActivation()` for the branching.
+    private let pttMonitor = PushToTalkMonitor()
+
+    /// True between a PTT press and its matching release. Set inside
+    /// the press handler before kicking off `start()`, cleared inside
+    /// the release handler. Used by `start()` to detect "user pressed
+    /// then released too fast for the model load to finish" — without
+    /// this flag the orb would appear right as the user lifts their
+    /// fingers, then sit there waiting for a no-speech timeout.
+    private var pttPressActive: Bool = false
 
     // MARK: - Session state
 
@@ -220,6 +263,13 @@ final class DictationCoordinator: ObservableObject {
         self.hotkeyEnabled = defaults.object(forKey: Self.hotkeyEnabledKey) as? Bool ?? true
         self.silenceTimeoutSeconds =
             defaults.object(forKey: Self.silenceTimeoutKey) as? Double ?? 2.5
+        // Default to `.toggle` for back-compat. Anyone running before
+        // this build has no value at the activationMode key, so they
+        // get the original tap-to-toggle behavior they had pre-PTT.
+        let storedMode = defaults.string(forKey: Self.activationModeKey)
+            .flatMap(DictationActivationMode.init(rawValue:))
+            ?? .toggle
+        self.activationMode = storedMode
 
         // Listen for the Accessibility TCC change notification so the
         // UI flips from "not granted" → "granted" the instant the user
@@ -257,21 +307,53 @@ final class DictationCoordinator: ObservableObject {
     // MARK: - Hotkey wiring
 
     /// Called once at app launch. Applies the persisted `hotkeyEnabled`
-    /// value — registers the binding if on, unregisters if off.
+    /// + `activationMode` values — installs the right activation
+    /// surface (Carbon hotkey or PTT NSEvent monitor) if enabled,
+    /// uninstalls everything if disabled.
     func installHotkey() {
-        applyHotkeyRegistration()
+        applyActivation()
     }
 
-    private func applyHotkeyRegistration() {
+    /// Branches on `activationMode` to install the appropriate
+    /// activation surface. Always uninstalls both surfaces first so
+    /// switching modes mid-session (or repeated calls from the
+    /// `didSet` watchers) leaves a clean state — only one of
+    /// `hotkey` / `pttMonitor` is ever live.
+    ///
+    /// - `.toggle`: Carbon hotkey on ⌥Space — tap to start, tap to
+    ///   stop. Calls `toggle()` which dispatches to start/stop.
+    /// - `.pushToTalk`: PTT NSEvent monitor — press fires `pttPress()`
+    ///   which kicks off `start(activation: .pushToTalk)`; release
+    ///   fires `pttRelease()` which awaits `stop(reason: .release)`.
+    private func applyActivation() {
         hotkey.unregister()
+        pttMonitor.uninstall()
         guard hotkeyEnabled else { return }
-        hotkey.register(
-            keyCode: HotkeyManager.Key.space,
-            modifiers: HotkeyManager.Modifier.option.rawValue
-        ) { [weak self] in
-            Task { @MainActor [weak self] in
-                await self?.toggle()
+
+        switch activationMode {
+        case .toggle:
+            hotkey.register(
+                keyCode: HotkeyManager.Key.space,
+                modifiers: HotkeyManager.Modifier.option.rawValue
+            ) { [weak self] in
+                Task { @MainActor [weak self] in
+                    await self?.toggle()
+                }
             }
+
+        case .pushToTalk:
+            pttMonitor.install(
+                onPress: { [weak self] in
+                    Task { @MainActor [weak self] in
+                        await self?.pttPress()
+                    }
+                },
+                onRelease: { [weak self] in
+                    Task { @MainActor [weak self] in
+                        await self?.pttRelease()
+                    }
+                }
+            )
         }
     }
 
@@ -367,13 +449,42 @@ final class DictationCoordinator: ObservableObject {
         if isDictating {
             await stop(reason: .hotkey)
         } else {
-            await start()
+            await start(activation: .toggle)
         }
+    }
+
+    // MARK: - Push-to-talk
+
+    /// PTT press handler. Marks the press active and kicks off a new
+    /// session in PTT mode. We mark `pttPressActive = true` BEFORE the
+    /// `start()` await so a fast follow-up release sees the active
+    /// state and can flip it to false; `start()` then notices the
+    /// release happened during setup and tears the session down.
+    private func pttPress() async {
+        // Already running (e.g. a stale event arrived during teardown
+        // of a previous session) — don't double-start.
+        guard !isDictating else { return }
+        pttPressActive = true
+        await start(activation: .pushToTalk)
+    }
+
+    /// PTT release handler. Either commits the active session via
+    /// `stop(reason: .release)` or flips `pttPressActive` so an
+    /// in-flight `start()` can teardown immediately when it finishes
+    /// model loading.
+    private func pttRelease() async {
+        pttPressActive = false
+        // Only act if we actually got the orb up. If `start()` is
+        // still in flight (model load), the flag flip above is enough
+        // — `start()` will check it after setup completes and call
+        // `stop(reason: .release)` itself.
+        guard isDictating else { return }
+        await stop(reason: .release)
     }
 
     // MARK: - Start
 
-    private func start() async {
+    private func start(activation: DictationActivationMode) async {
         // Don't piggy-back on a meeting recording.
         guard !manager.isBusy else {
             NSSound.beep()
@@ -407,6 +518,7 @@ final class DictationCoordinator: ObservableObject {
         clipboardPreservationTask = nil
         isPaused = false
         cancelFlashAt = nil
+        sessionActivation = activation
 
         // Show the orb IMMEDIATELY so the user gets feedback, even if
         // we need a few seconds to load the model first. The overlay
@@ -493,10 +605,27 @@ final class DictationCoordinator: ObservableObject {
             return
         }
 
+        // PTT-specific edge case: the user might have already released
+        // the keys while we were loading the Whisper model. If so the
+        // press handler set `pttPressActive = true`, the release
+        // handler flipped it back to false, and now we're here with no
+        // one holding the keys. Tear down immediately rather than
+        // leaving an orb dangling for the no-speech timeout to catch
+        // 8 seconds later.
+        if sessionActivation == .pushToTalk, !pttPressActive {
+            await stop(reason: .release)
+            return
+        }
+
         // Engine is hot and the orb is visible — arm the conditional
-        // bindings that only make sense during an active dictation.
-        installPauseHotkey()
-        installEscapeMonitor()
+        // bindings that only make sense during an active *toggle-mode*
+        // dictation. PTT skips both: pause makes no sense (the user
+        // is actively holding the activation keys, can't reach ⌥P)
+        // and escape-to-cancel is redundant with key release.
+        if sessionActivation == .toggle {
+            installPauseHotkey()
+            installEscapeMonitor()
+        }
     }
 
     // MARK: - Stop
@@ -505,6 +634,13 @@ final class DictationCoordinator: ObservableObject {
         case hotkey
         case silenceTimeout
         case noSpeechTimeout
+        /// PTT mode only: user lifted ⌥ or Space, signaling
+        /// end-of-utterance. Treated like `.hotkey` for teardown
+        /// purposes — the user explicitly ended the session, so we
+        /// flush whatever final tail has accumulated since the last
+        /// paste boundary (which in PTT mode is "everything", since
+        /// PTT skips the phase-1 mid-session commits).
+        case release
     }
 
     private func stop(reason: StopReason) async {
@@ -971,6 +1107,16 @@ final class DictationCoordinator: ObservableObject {
             return
         }
 
+        // PTT mode commits ONLY on key release. Skip both silence
+        // thresholds — the user is actively holding the activation
+        // keys, so a silence-based commit would be wrong (they're
+        // mid-utterance, just paused) and a silence-based teardown
+        // would be even wronger (yanking the orb out from under a
+        // user who's still holding the keys is the worst possible
+        // UX). The no-speech-yet timeout above still fires so a
+        // PTT-press-with-no-speech doesn't strand an orb forever.
+        if sessionActivation == .pushToTalk { return }
+
         // Had speech already — two thresholds:
         //
         //   • At elapsed = T (`silenceTimeoutSeconds`): the countdown
@@ -1007,6 +1153,10 @@ final class DictationCoordinator: ObservableObject {
     deinit {
         hotkey.unregister()
         pauseHotkey.unregister()
+        // PushToTalkMonitor's own deinit also rips its monitors, but
+        // we explicitly tear ours down here for parity with the
+        // toggle-mode hotkey teardown above. NSEvent.removeMonitor
+        // is documented as safe from any thread.
         if let escapeMonitor {
             NSEvent.removeMonitor(escapeMonitor)
         }

@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import HumdrumCore
 
 /// Native Settings window (⌘,). Two tabs: Dictation and About.
 struct SettingsView: View {
@@ -159,7 +160,7 @@ private struct DictationSettingsTab: View {
                 Toggle(isOn: $dictation.hotkeyEnabled) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Global hotkey for dictation")
-                        Text("Press **⌥Space** from any app to start dictating into the focused text field. Press again or pause for 2.5 s to stop.")
+                        Text(hotkeySubtitle)
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
@@ -174,26 +175,44 @@ private struct DictationSettingsTab: View {
             }
 
             Section {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack {
-                        Text("Auto-stop after")
-                        Spacer()
-                        Text(String(format: "%.1fs of silence", dictation.silenceTimeoutSeconds))
-                            .monospacedDigit()
+                activationModePicker
+            } header: {
+                Text("Activation")
+            } footer: {
+                Text(dictation.activationMode.detail)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            // Silence detection only applies in toggle mode. In PTT
+            // mode there's no silence-based commit boundary — the
+            // user's key release is the only commit signal — so the
+            // slider would be cosmetic at best and misleading at
+            // worst. Hide the whole section.
+            if dictation.activationMode == .toggle {
+                Section {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("Auto-stop after")
+                            Spacer()
+                            Text(String(format: "%.1fs of silence", dictation.silenceTimeoutSeconds))
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
+                        }
+                        Slider(
+                            value: $dictation.silenceTimeoutSeconds,
+                            in: 1.0...5.0,
+                            step: 0.5
+                        )
+                        .tint(AppTheme.accent)
+                        Text("Dictation stops on its own when you've been silent for this long. Hitting ⌥Space always stops immediately.")
+                            .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
-                    Slider(
-                        value: $dictation.silenceTimeoutSeconds,
-                        in: 1.0...5.0,
-                        step: 0.5
-                    )
-                    .tint(AppTheme.accent)
-                    Text("Dictation stops on its own when you've been silent for this long. Hitting ⌥Space always stops immediately.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
+                } header: {
+                    Text("Silence detection")
                 }
-            } header: {
-                Text("Silence detection")
             }
 
             Section {
@@ -209,6 +228,34 @@ private struct DictationSettingsTab: View {
             // the state flip to granted within ~1.5 s of enabling it
             // (silent — no system prompt).
             dictation.refreshAccessibilityStatus()
+        }
+    }
+
+    /// Mode-dependent subtitle copy for the hotkey toggle. The
+    /// silence-stop sentence only makes sense in toggle mode; PTT
+    /// users get the press-and-hold instruction instead.
+    private var hotkeySubtitle: String {
+        switch dictation.activationMode {
+        case .toggle:
+            return "Press ⌥Space from any app to start dictating into the focused text field. Press again or pause for 2.5 s to stop."
+        case .pushToTalk:
+            return "Hold ⌥Space from any app to dictate into the focused text field. Release to commit."
+        }
+    }
+
+    /// Segmented picker between toggle and push-to-talk activation.
+    /// Bound directly to `dictation.activationMode`, whose `didSet`
+    /// re-installs the activation surface immediately, so a flip
+    /// here takes effect on the next ⌥Space.
+    private var activationModePicker: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Picker("Activation mode", selection: $dictation.activationMode) {
+                ForEach(DictationActivationMode.allCases, id: \.self) { mode in
+                    Text(mode.shortLabel).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
         }
     }
 

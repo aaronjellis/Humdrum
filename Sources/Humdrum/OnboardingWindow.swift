@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import HumdrumCore
 
 // MARK: - Window wrapper
 
@@ -8,7 +9,7 @@ import AppKit
 /// model, save folder) other than the one download they explicitly
 /// accept on the voice-model panel.
 ///
-/// The flow itself is five panels managed by `OnboardingState`. Each
+/// The flow itself is seven panels managed by `OnboardingState`. Each
 /// panel is a self-contained subview so they're easy to edit in
 /// isolation without threading layout through a single 500-line body.
 struct OnboardingWindow: View {
@@ -32,6 +33,8 @@ struct OnboardingWindow: View {
                     WelcomePanel()
                 case .features:
                     FeaturesPanel()
+                case .activation:
+                    ActivationModePanel()
                 case .voiceModel:
                     VoiceModelPanel()
                 case .permissions:
@@ -261,7 +264,109 @@ private struct FeatureCard: View {
     }
 }
 
-// MARK: - 3. Voice model
+// MARK: - 3. Activation mode
+
+/// Lets the user choose between tap-to-toggle and press-and-hold for
+/// the Mutter ⌥Space binding. The default we'd pick for them is
+/// `.toggle` (matches Whisper Flow / Superwhisper, the most common
+/// dictation pattern), but on first run we surface the choice
+/// explicitly so users in loud environments — where silence-based
+/// auto-stop misfires — can pick PTT before they ever experience the
+/// frustration. Two cards, same visual rhythm as the FeaturesPanel.
+private struct ActivationModePanel: View {
+    @EnvironmentObject var onboarding: OnboardingState
+    @EnvironmentObject var dictation: DictationCoordinator
+
+    var body: some View {
+        PanelScaffold(
+            title: "How do you want to start dictating?",
+            subtitle: "Want to press and hold to dictate, or press once and let it listen, then stop when you stop talking?",
+            panel: .activation
+        ) {
+            VStack(spacing: 20) {
+                VStack(spacing: 10) {
+                    ForEach(DictationActivationMode.allCases, id: \.self) { mode in
+                        ActivationModeCard(
+                            mode: mode,
+                            selected: dictation.activationMode == mode
+                        ) {
+                            dictation.activationMode = mode
+                        }
+                    }
+                }
+
+                Text("You can change this any time in Settings → Dictation.")
+                    .font(.system(size: 12))
+                    .foregroundStyle(AppTheme.textTertiary)
+
+                HStack(spacing: 10) {
+                    SecondaryButton(title: "Back") {
+                        onboarding.back()
+                    }
+                    PrimaryButton(title: "Continue") {
+                        onboarding.next()
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One card for each activation mode. Visually mirrors `FeatureCard`
+/// (same padding, same icon-square treatment) but adds a radio-style
+/// selection indicator on the trailing edge so the panel reads as
+/// "pick one" rather than "two things you can do."
+private struct ActivationModeCard: View {
+    let mode: DictationActivationMode
+    let selected: Bool
+    let tap: () -> Void
+
+    var body: some View {
+        Button(action: tap) {
+            HStack(alignment: .top, spacing: 14) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(selected ? AppTheme.accentSoft : AppTheme.panelElevated)
+                        .frame(width: 40, height: 40)
+                    Image(systemName: iconName)
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundStyle(selected ? AppTheme.accent : AppTheme.textSecondary)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(mode.shortLabel)
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(AppTheme.textPrimary)
+                    Text(mode.detail)
+                        .font(.system(size: 12))
+                        .foregroundStyle(AppTheme.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer(minLength: 8)
+
+                Image(systemName: selected ? "largecircle.fill.circle" : "circle")
+                    .font(.system(size: 18, weight: .regular))
+                    .foregroundStyle(selected ? AppTheme.accent : AppTheme.textTertiary)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 12)
+            .configonautCard(tinted: selected)
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// Per-mode glyph. Tap-to-toggle reads as a single keystroke;
+    /// press-and-hold gets a "hand pressing keys" feel.
+    private var iconName: String {
+        switch mode {
+        case .toggle:     return "hand.tap.fill"
+        case .pushToTalk: return "hand.point.up.left.fill"
+        }
+    }
+}
+
+// MARK: - 4. Voice model
 
 private struct VoiceModelPanel: View {
     @EnvironmentObject var onboarding: OnboardingState
@@ -460,7 +565,7 @@ private struct Badge: View {
     }
 }
 
-// MARK: - 4. Permissions
+// MARK: - 5. Permissions
 
 private struct PermissionsPanel: View {
     @EnvironmentObject var onboarding: OnboardingState
@@ -572,7 +677,7 @@ private struct PermissionRow: View {
     }
 }
 
-// MARK: - 5. Folder
+// MARK: - 6. Folder
 
 private struct FolderPanel: View {
     @EnvironmentObject var onboarding: OnboardingState
@@ -702,7 +807,7 @@ private struct FolderPill: View {
     }
 }
 
-// MARK: - 6. Success
+// MARK: - 7. Success
 
 private struct SuccessPanel: View {
     @EnvironmentObject var onboarding: OnboardingState
