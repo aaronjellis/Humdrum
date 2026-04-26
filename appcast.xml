@@ -1,0 +1,9 @@
+<?xml version='1.0' encoding='utf-8'?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
+  <channel>
+    <item><title>Version 0.2.0</title><pubDate>Sun, 26 Apr 2026 22:55:38 +0000</pubDate><sparkle:version>20.0</sparkle:version><sparkle:shortVersionString>0.2.0</sparkle:shortVersionString><description><![CDATA[<p>**Full Changelog**: https://github.com/aaronjellis/Humdrum/commits/v0.2.0</p>]]></description><enclosure sparkle:edSignature="dxd9X3qOobAAXq//Jby9od5iAlcabSn/nhqMbKhAd42zZ0k+Y/fIOk6gnVBU8C6Evr2pmlGpsd5Gv2aq0HqHAg==" length="139051578" url="https://github.com/aaronjellis/Humdrum/releases/download/v0.2.0/Humdrum.zip" type="application/octet-stream" /></item><title>Humdrum Updates</title>
+    <link>https://github.com/aaronjellis/Humdrum</link>
+    <description>Latest Humdrum releases.</description>
+    <language>en</language>
+  </channel>
+</rss>
