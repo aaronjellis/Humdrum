@@ -208,6 +208,23 @@ final class TranscriptionManager: ObservableObject {
     /// on its start/stop boundaries; nothing else should mutate this.
     var commitThresholds: CommitThresholds = .meeting
 
+    /// When false, `start()` skips `startTranscriptionLoop()` — no
+    /// live `runStep`/`hitMax` chunked commits during the recording.
+    /// Audio still accumulates in the buffer; the level loop and timer
+    /// loop still run; `currentRMS` / `audioLevels` still update for the
+    /// silence detector and visualizer. The tail finalize on stop
+    /// processes the entire buffer as one Whisper pass.
+    ///
+    /// Used by `DictationCoordinator` for push-to-talk mode: there are
+    /// no phase-1 paste commits during a hold, so mid-hold chunking
+    /// produces no UX benefit and actively *loses* words at chunk
+    /// boundaries (Whisper drops trailing tokens of each 7 s hitMax
+    /// chunk because there's no segment-end cue, and the next chunk
+    /// starts mid-word). Skipping the loop entirely lets a continuous
+    /// 24 s utterance land as one clean transcription on release.
+    /// Toggle mode keeps this true so phase-1 commits still flow.
+    var liveTranscriptionEnabled: Bool = true
+
     // MARK: Internal
 
     private var whisperKit: WhisperKit?
@@ -443,7 +460,9 @@ final class TranscriptionManager: ObservableObject {
             isRecording = true
             status = "Recording…"
 
-            startTranscriptionLoop()
+            if liveTranscriptionEnabled {
+                startTranscriptionLoop()
+            }
             startTimerLoop()
             startLevelLoop()
         } catch {
@@ -640,6 +659,24 @@ final class TranscriptionManager: ObservableObject {
                     kit: kit
                 )
 
+                // Pad with 0.5 s of synthetic silence so Whisper sees
+                // a clear segment-end cue. Without this, push-to-talk
+                // release runs the tail transcribe on a buffer that
+                // ends mid-word — Whisper's segment-boundary heuristic
+                // never trips and the call returns empty text, so the
+                // user holds ⌥Space, speaks, releases, and nothing
+                // pastes. Toggle mode already has 6 s of natural
+                // trailing silence in the buffer (auto-stop only fires
+                // after that), so the padding is redundant there but
+                // harmless: Whisper's encoder pads to 30 s internally
+                // and the extra ~8 000 floats cost nothing on the ANE.
+                // RMS gating above is computed on the unpadded `window`
+                // so the noise floor still rejects pure-silence tails.
+                let paddedWindow = window + [Float](
+                    repeating: 0,
+                    count: sampleRate / 2
+                )
+
                 // Three possible outcomes from the raced task group:
                 // fresh Whisper text, WhisperKit throw, or 30 s
                 // deadline. Distinguishing timed-out vs. failed lets
@@ -656,7 +693,7 @@ final class TranscriptionManager: ObservableObject {
                     group.addTask {
                         do {
                             let results = try await kit.transcribe(
-                                audioArray: window,
+                                audioArray: paddedWindow,
                                 decodeOptions: options
                             )
                             if let raw = results.first?.text {

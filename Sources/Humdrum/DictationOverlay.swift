@@ -212,7 +212,15 @@ struct DictationOverlayView: View {
     /// the pill. Order matters: a paste failure is more urgent than a
     /// permission warning (the user just lost a dictation; tell them
     /// where the text is). On success, returns nil → pill is hidden.
+    ///
+    /// `transcribing` wins over everything else while it's true: the
+    /// paste outcome from the *previous* session is stale during the
+    /// finalize pass of the current one, and we don't want a leftover
+    /// failure pill flashing under a new orb. By the time
+    /// `isFinalizing` flips back to false, paste has already landed
+    /// and `pasteOutcome` reflects the current session correctly.
     private var currentStatus: StatusPill.Status? {
+        if manager.isFinalizing { return .transcribing }
         switch dictation.pasteOutcome {
         case .failed:      return .pasteFailed
         case .silentDrop:  return .silentDrop
@@ -469,12 +477,19 @@ struct StatusPill: View {
         case accessibilityMissing
         case pasteFailed
         case silentDrop
+        /// Transient "we're running the tail Whisper pass" state. Shown
+        /// between key release and paste-landing, primarily for PTT
+        /// where the whole utterance is transcribed at the end (1–3 s
+        /// on `base.en` for a 25 s hold). Without it, the user sees a
+        /// blank orb after release and wonders if anything's happening.
+        case transcribing
 
         var iconName: String {
             switch self {
             case .accessibilityMissing: return "exclamationmark.triangle.fill"
             case .pasteFailed:          return "exclamationmark.circle.fill"
             case .silentDrop:           return "exclamationmark.circle.fill"
+            case .transcribing:         return "waveform"
             }
         }
 
@@ -486,7 +501,17 @@ struct StatusPill: View {
                 return "Couldn't paste — text on your clipboard, ⌘V to insert"
             case .silentDrop:
                 return "That app didn't take the paste — ⌘V to insert"
+            case .transcribing:
+                return "Transcribing…"
             }
+        }
+
+        /// Transcribing is an informational, transient state — not an
+        /// alarm — so it gets a neutral fill instead of the danger pink
+        /// the other three share. Same shape, same position; the colour
+        /// is the disambiguator.
+        var isInformational: Bool {
+            self == .transcribing
         }
     }
 
@@ -496,6 +521,11 @@ struct StatusPill: View {
         HStack(spacing: 6) {
             Image(systemName: status.iconName)
                 .font(.system(size: 10, weight: .bold))
+                .symbolEffect(
+                    .variableColor.iterative,
+                    options: .repeating,
+                    isActive: status == .transcribing
+                )
             Text(status.message)
                 .font(.system(size: 11, weight: .medium))
         }
@@ -503,13 +533,25 @@ struct StatusPill: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
         .background(
-            Capsule().fill(AppTheme.danger.opacity(0.92))
+            Capsule().fill(fillColor)
         )
         .overlay(
             Capsule().stroke(Color.white.opacity(0.25), lineWidth: 0.6)
         )
-        .shadow(color: AppTheme.danger.opacity(0.45), radius: 10, y: 3)
+        .shadow(color: shadowColor, radius: 10, y: 3)
         .allowsHitTesting(false)
+    }
+
+    private var fillColor: Color {
+        status.isInformational
+            ? Color.white.opacity(0.18)
+            : AppTheme.danger.opacity(0.92)
+    }
+
+    private var shadowColor: Color {
+        status.isInformational
+            ? Color.black.opacity(0.35)
+            : AppTheme.danger.opacity(0.45)
     }
 }
 

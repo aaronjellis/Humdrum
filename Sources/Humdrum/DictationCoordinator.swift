@@ -203,6 +203,25 @@ final class DictationCoordinator: ObservableObject {
     /// fingers, then sit there waiting for a no-speech timeout.
     private var pttPressActive: Bool = false
 
+    /// Monotonically increasing per-session counter, bumped at the top
+    /// of every `start()`. `stop()` captures this at entry and re-reads
+    /// it after the (long) snapshot-finalize await; a mismatch means a
+    /// new session began during the await, and the rest of `stop()`'s
+    /// epilogue (manager-settings restore, orb linger + hide) belongs
+    /// to the *new* session — running it on the stale generation
+    /// clobbers the new session's saved manager state and yanks the
+    /// new session's orb off-screen. Wraparound is fine; the
+    /// disambiguation only needs to detect "different from before."
+    private var sessionGeneration: UInt = 0
+
+    /// Highest `manager.currentRMS` observed since the current session
+    /// started. Diagnostic-only: surfaced in `session.timeout` and
+    /// `session.stop.ok` logs so we can see what the mic actually
+    /// produced when the speech detector decided "you didn't speak."
+    /// Useful for tuning `silenceRMSThreshold` against real mic levels
+    /// (laptop built-in, AirPods, USB mic) without guessing.
+    private var peakRMSSinceStart: Float = 0
+
     // MARK: - Session state
 
     private var savedOnCompleted: ((TranscriptSessionSnapshot) -> Void)?
@@ -210,6 +229,7 @@ final class DictationCoordinator: ObservableObject {
     private var savedNoiseFilter: NoiseFilterLevel = .normal
     private var savedVocabHints: String = ""
     private var savedCommitThresholds: CommitThresholds = .meeting
+    private var savedLiveTranscriptionEnabled: Bool = true
 
     private var silenceTask: Task<Void, Never>?
     private var tccObserver: NSObjectProtocol?
@@ -519,6 +539,9 @@ final class DictationCoordinator: ObservableObject {
             return
         }
 
+        sessionGeneration &+= 1
+        peakRMSSinceStart = 0
+
         pasteOutcome = .succeeded
         lastSpeechTime = nil
         lastChunkPastedAt = nil
@@ -537,6 +560,7 @@ final class DictationCoordinator: ObservableObject {
         // disappears in real time if the user flips Accessibility on
         // while the orb is already up.
         isDictating = true
+        Diagnostics.ui.info("orb.show site=start mode=\(activation.rawValue, privacy: .public)")
         overlay.show(DictationOverlayView(manager: manager, dictation: self))
 
         // Ensure the Whisper model is loaded before we start recording.
@@ -550,6 +574,7 @@ final class DictationCoordinator: ObservableObject {
             // Load failed — drop the overlay and bail.
             Diagnostics.dictation.error("session.start.aborted reason=model_load_failed")
             isDictating = false
+            Diagnostics.ui.info("orb.hide site=start_aborted_model_load_failed")
             overlay.hide()
             return
         }
@@ -561,6 +586,7 @@ final class DictationCoordinator: ObservableObject {
         savedNoiseFilter = manager.noiseFilterLevel
         savedVocabHints = manager.vocabularyHints
         savedCommitThresholds = manager.commitThresholds
+        savedLiveTranscriptionEnabled = manager.liveTranscriptionEnabled
 
         // Clear the manager's session-completion callback for the
         // duration of dictation. Dictations aren't meetings — they
@@ -577,6 +603,17 @@ final class DictationCoordinator: ObservableObject {
         // at end-of-utterance, the tighter cadence keeps the tail
         // Whisper pass cheap so `stop()` finalizes quickly.
         manager.commitThresholds = .dictation
+
+        // Push-to-talk: skip the manager's live transcription loop
+        // entirely. Mid-hold `hitMax` chunking at 7 s drops trailing
+        // tokens at every chunk boundary (no segment-end cue), and
+        // PTT shows no live text anyway, so the chunking has no UX
+        // benefit. With this flag false, audio accumulates in the
+        // buffer and the tail finalize on stop transcribes the whole
+        // thing in one Whisper pass — no boundary word loss.
+        // Toggle keeps live transcription on so phase-1 commits still
+        // paste mid-session as the user pauses between phrases.
+        manager.liveTranscriptionEnabled = (activation != .pushToTalk)
 
         // Reset the session anchor now that the model is actually
         // ready — otherwise a slow first-time model download would
@@ -608,6 +645,8 @@ final class DictationCoordinator: ObservableObject {
             manager.noiseFilterLevel = savedNoiseFilter
             manager.vocabularyHints = savedVocabHints
             manager.commitThresholds = savedCommitThresholds
+            manager.liveTranscriptionEnabled = savedLiveTranscriptionEnabled
+            Diagnostics.ui.info("orb.hide site=start_aborted_manager_not_recording")
             overlay.hide()
             NSSound.beep()
             // If permission was the issue, flip macOS over to the right
@@ -622,15 +661,26 @@ final class DictationCoordinator: ObservableObject {
         }
 
         // PTT-specific edge case: the user might have already released
-        // the keys while we were loading the Whisper model. If so the
-        // press handler set `pttPressActive = true`, the release
-        // handler flipped it back to false, and now we're here with no
-        // one holding the keys. Tear down immediately rather than
-        // leaving an orb dangling for the no-speech timeout to catch
-        // 8 seconds later.
+        // the keys while we were loading the Whisper model OR while
+        // `manager.start()` was awaiting the prior session's finalize.
+        // If so the press handler set `pttPressActive = true`, the
+        // release handler flipped it back to false (and called
+        // `stop(reason: .release)`, which already set isDictating=false
+        // and started its own snapshot continuation), and now we're
+        // here with the manager freshly recording but no one holding
+        // the keys. Stop the *manager* directly: the coordinator-side
+        // teardown is already in flight on the earlier stop, but its
+        // continuation can't progress because its in-line manager.stop()
+        // bailed (manager.isRecording was false at that moment) and
+        // its onSessionCompleted callback is still armed. Calling
+        // manager.stop() here fires that callback, unblocking the
+        // earlier continuation instead of letting it sit on its 5 s
+        // timeout — and crucially prevents the orphaned recording
+        // that was the cause of "manager_busy" lockouts requiring an
+        // app relaunch.
         if sessionActivation == .pushToTalk, !pttPressActive {
             Diagnostics.dictation.info("session.start.aborted reason=ptt_released_during_load")
-            await stop(reason: .release)
+            await manager.stop()
             return
         }
 
@@ -667,6 +717,14 @@ final class DictationCoordinator: ObservableObject {
     private func stop(reason: StopReason) async {
         guard isDictating else { return }
         let stopStart = Date()
+        // Capture the generation we're stopping. Manager-finalize is
+        // async and can take a second on a long tail; if the user
+        // re-presses ⌥Space during that await, a new session begins
+        // and bumps `sessionGeneration`. We re-check before the late
+        // epilogue (settings restore, orb linger + hide) and bail if
+        // we've been superseded — otherwise we'd clobber the new
+        // session's saved settings and yank its orb off-screen.
+        let myGeneration = sessionGeneration
         Diagnostics.dictation.info(
             "session.stop.requested reason=\(String(describing: reason), privacy: .public) pastedSoFar=\(self.pastedCharCount, privacy: .public)"
         )
@@ -802,6 +860,22 @@ final class DictationCoordinator: ObservableObject {
             }
         }
 
+        // Race guard. The snapshot await above can take ~1 s on a long
+        // tail; if the user re-pressed ⌥Space during that window a new
+        // session has already begun and bumped `sessionGeneration`.
+        // The new session has captured its own `savedOnCompleted` /
+        // vocab / thresholds — restoring our (older) saved values here
+        // would overwrite them with stale data, and the linger-then-
+        // hide below would yank the new session's orb. Both belong to
+        // whoever is current. The OLD session's text has already been
+        // pasted above; nothing more is owed.
+        if myGeneration != sessionGeneration {
+            Diagnostics.ui.info(
+                "stop.epilogue.skipped reason=\(String(describing: reason), privacy: .public) cause=new_session_active myGen=\(myGeneration, privacy: .public) currentGen=\(self.sessionGeneration, privacy: .public)"
+            )
+            return
+        }
+
         // Restore manager settings so meeting mode works as before.
         // Order matters: this comes AFTER the snapshot continuation
         // resolved, so our one-shot onSessionCompleted callback has
@@ -813,6 +887,7 @@ final class DictationCoordinator: ObservableObject {
         manager.noiseFilterLevel = savedNoiseFilter
         manager.vocabularyHints = savedVocabHints
         manager.commitThresholds = savedCommitThresholds
+        manager.liveTranscriptionEnabled = savedLiveTranscriptionEnabled
 
         let elapsedMs = Int(Date().timeIntervalSince(stopStart) * 1000)
         Diagnostics.dictation.info(
@@ -836,6 +911,24 @@ final class DictationCoordinator: ObservableObject {
         let lingerNs: UInt64 = (pasteOutcome == .succeeded) ? 250_000_000 : 4_500_000_000
         try? await Task.sleep(nanoseconds: lingerNs)
 
+        // Second race guard. The 250 ms linger above is itself a yield
+        // point — a fast re-press during that window starts a new
+        // session, bumps `sessionGeneration`, and shows a new orb.
+        // Calling `overlay.hide()` here without re-checking would yank
+        // *that* orb off-screen 250 ms after it appeared, even though
+        // the new session is still live and recording. The pre-linger
+        // check above caught new-session-during-snapshot-await; this
+        // one catches new-session-during-linger.
+        if myGeneration != sessionGeneration {
+            Diagnostics.ui.info(
+                "orb.hide.skipped site=stop reason=\(String(describing: reason), privacy: .public) cause=new_session_active_during_linger myGen=\(myGeneration, privacy: .public) currentGen=\(self.sessionGeneration, privacy: .public)"
+            )
+            return
+        }
+
+        Diagnostics.ui.info(
+            "orb.hide site=stop reason=\(String(describing: reason), privacy: .public) lingerMs=\(Int(lingerNs / 1_000_000), privacy: .public) isDictating=\(self.isDictating, privacy: .public)"
+        )
         overlay.hide()
     }
 
@@ -1039,6 +1132,7 @@ final class DictationCoordinator: ObservableObject {
         // doesn't need to see the orb sit while Whisper finalizes.
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 350_000_000)
+            Diagnostics.ui.info("orb.hide site=cancel lingerMs=350")
             self?.overlay.hide()
         }
 
@@ -1049,6 +1143,7 @@ final class DictationCoordinator: ObservableObject {
         manager.noiseFilterLevel = savedNoiseFilter
         manager.vocabularyHints = savedVocabHints
         manager.commitThresholds = savedCommitThresholds
+        manager.liveTranscriptionEnabled = savedLiveTranscriptionEnabled
     }
 
     /// Registers the ⌥P binding on `pauseHotkey`. Logs and continues
@@ -1140,6 +1235,7 @@ final class DictationCoordinator: ObservableObject {
         // rarely clear, so the silence auto-stop effectively never
         // fired. Real-mic silence crosses below 0.015 raw routinely.
         let isSpeaking = manager.currentRMS >= silenceRMSThreshold
+        peakRMSSinceStart = max(peakRMSSinceStart, manager.currentRMS)
 
         if isSpeaking {
             lastSpeechTime = Date()
@@ -1151,7 +1247,7 @@ final class DictationCoordinator: ObservableObject {
         if lastSpeechTime == nil,
            Date().timeIntervalSince(start) >= noSpeechTimeoutSeconds {
             Diagnostics.dictation.info(
-                "session.timeout fired=noSpeech budgetSec=\(self.noSpeechTimeoutSeconds, privacy: .public)"
+                "session.timeout fired=noSpeech budgetSec=\(self.noSpeechTimeoutSeconds, privacy: .public) peakRMS=\(self.peakRMSSinceStart, privacy: .public) threshold=\(self.silenceRMSThreshold, privacy: .public)"
             )
             Task { await self.stop(reason: .noSpeechTimeout) }
             return
