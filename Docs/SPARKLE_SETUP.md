@@ -347,8 +347,10 @@ does.
 **3. Bump the version + tag.**
 
 ```bash
-# Bump the short version in Info.plist manually (e.g. 0.2.0 → 0.3.0).
-# CFBundleVersion is auto-bumped by build-app.sh, don't touch it.
+# Bump CFBundleShortVersionString in Info.plist (e.g. 0.2.0 → 0.3.0).
+# CFBundleVersion is mirrored from CFBundleShortVersionString at build
+# time — there's only one version to maintain. Sparkle compares the
+# dotted components, so big jumps (0.2.0 → 0.234.0) are fine.
 
 git add Info.plist RELEASE_NOTES/v0.3.0.md
 git commit -m "release 0.3.0"

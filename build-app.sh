@@ -205,50 +205,23 @@ install_name_tool -add_rpath "@executable_path/../Frameworks" \
   "${APP_DIR}/Contents/MacOS/${APP_NAME}" 2>/dev/null || true
 
 # --------------------------------------------------------------------------
-# Auto-bump CFBundleVersion on every build, monotonically.
+# Single-version policy.
 #
-# The short version (CFBundleShortVersionString, e.g. "0.2.0") is the
-# semantic version and stays under human control in Info.plist. The
-# build number (CFBundleVersion) is what we bump automatically, so
-# the version shown in Settings → About changes every time you rebuild.
-# That makes it trivial to confirm "am I actually running the build I
-# just made?" — just peek at Settings.
+# `CFBundleShortVersionString` is the version. There is no separate
+# auto-bumped build number — `CFBundleVersion` is set to the SAME
+# string at build time so macOS's About box (which prints both as
+# "Version X (Y)") shows just one value, twice. Bump short version
+# in Info.plist when shipping; CI sees the bump and Sparkle picks
+# up the higher dotted-component compare.
 #
-# Monotonic strategy:
-#   1. Prefer `git rev-list --count HEAD` — a clean, reproducible
-#      integer that increases as commits land.
-#   2. Add +1 per uncommitted rebuild within a session via a
-#      .build-number file (keeps dev iterations visibly distinct
-#      without needing a commit in between).
-#   3. Fall back to unix timestamp if git isn't available.
+# Big jumps are fine (0.2.0 → 0.234.0 is intentional shorthand for
+# "I cut a lot of patches and don't want to baby semver"). What
+# matters is monotonic dotted-decimal comparison, which Sparkle
+# handles natively.
 # --------------------------------------------------------------------------
-compute_build_number() {
-  local base=""
-  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    base="$(git rev-list --count HEAD 2>/dev/null || echo "")"
-  fi
-  # Per-rebuild increment for the same commit. Keeps the file under
-  # version control ignored (see .gitignore note below).
-  local counter_file=".build-number"
-  local counter=0
-  if [ -f "${counter_file}" ]; then
-    counter="$(cat "${counter_file}" | tr -d '[:space:]' || echo "0")"
-    counter=$((counter + 1))
-  fi
-  echo "${counter}" > "${counter_file}"
-  if [ -n "${base}" ]; then
-    echo "${base}.${counter}"
-  else
-    # No git — use epoch seconds as a fallback. Still monotonically
-    # increasing for a given clock, still sortable.
-    echo "$(date +%s)"
-  fi
-}
-
-BUILD_NUMBER="$(compute_build_number)"
-SHORT_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "${APP_DIR}/Contents/Info.plist" 2>/dev/null || echo "?")"
-/usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${BUILD_NUMBER}" "${APP_DIR}/Contents/Info.plist"
-echo "==> Version stamped: v${SHORT_VERSION} (build ${BUILD_NUMBER})"
+SHORT_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "${APP_DIR}/Contents/Info.plist")"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${SHORT_VERSION}" "${APP_DIR}/Contents/Info.plist"
+echo "==> Version stamped: v${SHORT_VERSION}"
 
 # --------------------------------------------------------------------------
 # App icon
