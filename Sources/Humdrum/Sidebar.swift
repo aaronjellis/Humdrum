@@ -290,7 +290,14 @@ struct Sidebar: View {
 
             Spacer()
 
-            Text("v0.1.0")
+            // Pull from Info.plist so this string can never drift away
+            // from CFBundleShortVersionString. The previous hand-typed
+            // "v0.1.0" sat here through several real version bumps and
+            // showed up as a third, contradicting version next to the
+            // About box. The `?? "?"` fallback is purely defensive —
+            // CFBundleShortVersionString is mandatory in any valid
+            // bundle, so the fallback should never render.
+            Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?")")
                 .font(.system(size: 10))
                 .foregroundStyle(AppTheme.textTertiary)
         }
