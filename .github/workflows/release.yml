@@ -249,9 +249,25 @@ jobs:
           import xml.etree.ElementTree as ET
           import re, os
 
-          ET.register_namespace('sparkle', 'http://www.andymatuschak.org/xml-namespaces/sparkle')
+          NS = 'http://www.andymatuschak.org/xml-namespaces/sparkle'
+          ET.register_namespace('sparkle', NS)
           tree = ET.parse('appcast.xml')
           channel = tree.find('channel')
+
+          # Re-cuts of the same version (we did this several times for
+          # v0.2.0 during the initial pipeline shakedown) used to leave
+          # stale items in the feed: the prepend-only path appended a
+          # new <item> without removing the old one, so the appcast
+          # carried two entries for the same shortVersionString. Sparkle
+          # picks by build number so users were unaffected, but the
+          # duplicate is ugly and ages badly. Strip any pre-existing
+          # entry with this shortVersionString before inserting the new
+          # one.
+          target_sv = "${SHORT_VERSION}"
+          for existing in list(channel.findall('item')):
+              sv = existing.findtext(f'{{{NS}}}shortVersionString')
+              if sv == target_sv:
+                  channel.remove(existing)
 
           item = ET.Element('item')
           ET.SubElement(item, 'title').text = "Version ${SHORT_VERSION}"
