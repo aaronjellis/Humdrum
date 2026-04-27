@@ -114,29 +114,50 @@ jobs:
           echo "SHORT_VERSION=$SHORT" >> "$GITHUB_ENV"
           echo "BUILD_VERSION=$BUILD" >> "$GITHUB_ENV"
 
+      - name: Build release notes from commits
+        run: |
+          set -euo pipefail
+          # Build notes from `git log` between the previous version tag
+          # and this one. Gives real, in-line changelog content rather
+          # than `--generate-notes`'s "**Full Changelog**: <link>" stub
+          # that's all you get when there are no merged PRs to summarise.
+          #
+          # Skip merge commits and the CI/release-infra commits that
+          # nobody downloading a release wants to see (`fix(release)`,
+          # `chore(ci)`, etc.). Cap at 30 lines so a long-overdue
+          # release doesn't dump a wall of text into Sparkle's sheet.
+          PREV_TAG=$(git tag --sort=-version:refname \
+                       | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+                       | grep -v "^${GITHUB_REF_NAME}\$" \
+                       | head -n 1 || true)
+          if [ -n "$PREV_TAG" ]; then
+            RANGE="${PREV_TAG}..${GITHUB_REF_NAME}"
+            HEADING="What's new in ${GITHUB_REF_NAME}"
+          else
+            RANGE="${GITHUB_REF_NAME}"
+            HEADING="Humdrum ${GITHUB_REF_NAME}"
+          fi
+          {
+            echo "## ${HEADING}"
+            echo ""
+            git log "$RANGE" --no-merges --pretty=format:'%s' \
+              | grep -vE '^(fix\(release\)|fix\(ci\)|chore\(release\)|chore\(ci\))' \
+              | sed 's/^/- /' \
+              | head -n 30
+            echo ""
+            echo ""
+            echo "**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/commits/${GITHUB_REF_NAME}"
+          } > /tmp/release_notes.md
+          echo "--- Generated notes ---"
+          cat /tmp/release_notes.md
+
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # `--generate-notes` builds the body from PRs and commits
-          # since the previous tag (or from repo start on the first
-          # release). No manual changelog upkeep — and the same body
-          # gets surfaced on Sparkle's update sheet via the appcast
-          # `<description>` we inject below.
           gh release create "$GITHUB_REF_NAME" Humdrum.zip \
             --title "Humdrum $GITHUB_REF_NAME" \
-            --generate-notes
-
-      - name: Fetch generated release notes
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          # Pull the body GitHub just generated so the Sparkle update
-          # sheet shows the same notes the GH release page shows. We
-          # write it to a file rather than an env var because release
-          # bodies routinely exceed GITHUB_ENV's per-line size budget.
-          gh release view "$GITHUB_REF_NAME" --json body -q .body > /tmp/release_notes.md
-          echo "Notes length: $(wc -c < /tmp/release_notes.md) bytes"
+            --notes-file /tmp/release_notes.md
 
       - name: Checkout gh-pages
         uses: actions/checkout@v4
@@ -177,9 +198,27 @@ jobs:
                   md = f.read()
           except FileNotFoundError:
               md = ''
-          # Minimal markdown → HTML. GitHub auto-notes are simple
-          # (## headings + bullet lists + PR links), so we don't need
-          # a full markdown parser — keep this dependency-free.
+
+          def inline(text: str) -> str:
+              """Convert a single line to HTML. Order matters: escape
+              first so user-supplied < / > are neutered; THEN apply
+              markdown substitutions which inject the only HTML tags
+              we want in the output. URLs are linkified after bold so
+              a URL inside `**...**` still gets wrapped."""
+              text = html.escape(text)
+              text = re.sub(r'\*\*([^*]+)\*\*', r'<strong>\1</strong>', text)
+              text = re.sub(r'(?<!\*)\*([^*\n]+)\*(?!\*)', r'<em>\1</em>', text)
+              text = re.sub(
+                  r'(https?://[^\s<]+)',
+                  lambda m: f'<a href="{m.group(1)}">{m.group(1)}</a>',
+                  text,
+              )
+              return text
+
+          # Minimal markdown → HTML. We keep this dependency-free; the
+          # workflow generates its own notes (## heading + bullet list
+          # + bold "Full Changelog" link line), so the surface area we
+          # need to support is small and stable.
           lines = []
           in_list = False
           for raw in md.splitlines():
@@ -187,25 +226,18 @@ jobs:
               if line.startswith('## '):
                   if in_list:
                       lines.append('</ul>'); in_list = False
-                  lines.append(f'<h3>{html.escape(line[3:])}</h3>')
+                  lines.append(f'<h3>{inline(line[3:])}</h3>')
               elif line.startswith('* ') or line.startswith('- '):
                   if not in_list:
                       lines.append('<ul>'); in_list = True
-                  text = html.escape(line[2:])
-                  # Re-link bare PR URLs that GH inserts.
-                  text = re.sub(
-                      r'(https?://\S+)',
-                      lambda m: f'<a href="{m.group(1)}">{m.group(1)}</a>',
-                      text,
-                  )
-                  lines.append(f'  <li>{text}</li>')
+                  lines.append(f'  <li>{inline(line[2:])}</li>')
               elif not line:
                   if in_list:
                       lines.append('</ul>'); in_list = False
               else:
                   if in_list:
                       lines.append('</ul>'); in_list = False
-                  lines.append(f'<p>{html.escape(line)}</p>')
+                  lines.append(f'<p>{inline(line)}</p>')
           if in_list:
               lines.append('</ul>')
           sys.stdout.write('\n'.join(lines))
