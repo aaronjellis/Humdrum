@@ -39,3 +39,22 @@ DerivedData/
 # User-specific editor files
 .vscode/
 .idea/
+
+# Personal planning / brainstorming artifacts at repo root.
+# Convention: real project docs live in Docs/ and are committed.
+# Anything at the repo root that looks like a planning artifact
+# (caps-and-underscores name, `feasibility_*`, `_bmad/` working
+# directory) is local-only and should never be committed.
+/DEVELOPMENT_PLAN.md
+/REVISED_DEVELOPMENT_PLAN.md
+/STARTER_PLAN.md
+/FEATURE_IDEATION.md
+/FINAL_REVIEW.md
+/FRUSTRATION_MINING.md
+/PHONE_MIC_DEEP_DIVE.md
+/TECHNICAL_FEASIBILITY.md
+/feasibility_*.md
+# `_bmad` is a symlink to a shared planning workspace; no trailing
+# slash here so the pattern matches the symlink itself.
+/_bmad
+/ADVERSARIAL_*.md
