@@ -302,25 +302,73 @@ jobs:
 
 ### Cutting a release
 
-Once the workflow is committed and secrets are in place:
+The ritual has four steps, in order. Skipping any of them produces a
+worse release — the workflow doesn't enforce them, by design (the
+shaping is a human decision), but the result is visible in the Sparkle
+update sheet your users see.
+
+**1. Review what's going in.**
+
+```bash
+# What changed since the previous tag?
+PREV=$(git describe --tags --abbrev=0 --match 'v*.*.*' 2>/dev/null || true)
+git log --oneline ${PREV:-HEAD~50}..HEAD
+git diff --stat ${PREV:-HEAD~50}..HEAD
+```
+
+Read both. Note the user-facing themes — new features, behavior
+changes, notable fixes — and which commits are internal-only (CI
+work, refactors, doc tweaks).
+
+**2. Write user-facing release notes.**
+
+Drop them at `RELEASE_NOTES/<tag>.md`. Treat this like a
+mini-launch announcement, not a changelog dump:
+
+- Lead with what's *new* — the feature a user could try right now.
+- Group by theme, not by commit.
+- Use plain, value-forward language — *"Push-to-talk: hold ⌥Space to
+  speak, release to paste"*, not *"feat(mutter): PTT activation
+  surface"*.
+- Bold the feature names so they scan.
+- End with a `**Full Changelog**:` link to
+  `https://github.com/<repo>/commits/<tag>` — Sparkle's update sheet
+  shows this for the curious.
+
+If you find yourself stuck, ask Claude to draft from the `git log`
+output — it's good at the shaping pass and you edit-to-taste from
+there. See `RELEASE_NOTES/v0.2.0.md` for the inaugural example.
+
+The release workflow prefers `RELEASE_NOTES/<tag>.md` if present and
+falls back to a raw commit log if missing — falling back is the
+**should-not-happen** path; the CI run will emit a warning when it
+does.
+
+**3. Bump the version + tag.**
 
 ```bash
 # Bump the short version in Info.plist manually (e.g. 0.2.0 → 0.3.0).
 # CFBundleVersion is auto-bumped by build-app.sh, don't touch it.
 
-git add Info.plist
+git add Info.plist RELEASE_NOTES/v0.3.0.md
 git commit -m "release 0.3.0"
 git tag v0.3.0
 git push origin main v0.3.0
 ```
 
-Watch the run in the **Actions** tab. On success:
-- A new GitHub Release appears with `Humdrum.zip` attached.
-- `gh-pages/appcast.xml` has a new `<item>` for this version.
-- `https://<user>.github.io/<repo>/appcast.xml` serves the update feed.
+**4. Watch + verify.**
 
-Existing users' copies of Humdrum will pick up the new version on their
-next scheduled check (or via **App menu → Check for Updates…**).
+In the **Actions** tab, follow the release run. On success:
+- A new GitHub Release appears with `Humdrum.zip` attached and your
+  curated notes as the body.
+- `gh-pages/appcast.xml` has a new `<item>` for this version
+  (existing same-version items are de-duped automatically).
+- `https://<user>.github.io/<repo>/appcast.xml` serves the update
+  feed.
+
+Existing users' copies of Humdrum will pick up the new version on
+their next scheduled check, or via **App menu → Check for
+Updates…**.
 
 ## 5. Smoke-test the updater locally
 

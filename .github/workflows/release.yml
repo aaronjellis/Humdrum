@@ -114,41 +114,51 @@ jobs:
           echo "SHORT_VERSION=$SHORT" >> "$GITHUB_ENV"
           echo "BUILD_VERSION=$BUILD" >> "$GITHUB_ENV"
 
-      - name: Build release notes from commits
+      - name: Build release notes
         run: |
           set -euo pipefail
-          # Build notes from `git log` between the previous version tag
-          # and this one. Gives real, in-line changelog content rather
-          # than `--generate-notes`'s "**Full Changelog**: <link>" stub
-          # that's all you get when there are no merged PRs to summarise.
+          # Curated release notes are part of the version-cut ritual:
+          # before tagging, a human (or Claude in a dev session) reads
+          # the diff since the last tag and writes user-focused notes
+          # into RELEASE_NOTES/<tag>.md. Committed alongside the version
+          # bump so past releases stay readable in-repo and the
+          # workflow has a deterministic file to reference.
           #
-          # Skip merge commits and the CI/release-infra commits that
-          # nobody downloading a release wants to see (`fix(release)`,
-          # `chore(ci)`, etc.). Cap at 30 lines so a long-overdue
-          # release doesn't dump a wall of text into Sparkle's sheet.
-          PREV_TAG=$(git tag --sort=-version:refname \
-                       | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
-                       | grep -v "^${GITHUB_REF_NAME}\$" \
-                       | head -n 1 || true)
-          if [ -n "$PREV_TAG" ]; then
-            RANGE="${PREV_TAG}..${GITHUB_REF_NAME}"
-            HEADING="What's new in ${GITHUB_REF_NAME}"
+          # Fall-through is the last-resort raw commit log: if the file
+          # is missing the workflow still ships, but the Sparkle sheet
+          # will look ugly — that's the signal you skipped the ritual.
+          # Skip merges + CI/release-infra commits and cap at 30 lines.
+          CURATED="RELEASE_NOTES/${GITHUB_REF_NAME}.md"
+          if [ -f "$CURATED" ]; then
+            echo "Using curated notes from ${CURATED}"
+            cp "$CURATED" /tmp/release_notes.md
           else
-            RANGE="${GITHUB_REF_NAME}"
-            HEADING="Humdrum ${GITHUB_REF_NAME}"
+            echo "::warning::No curated notes at ${CURATED} — falling back to commit log."
+            echo "::warning::Add the file before tagging to give users real release notes."
+            PREV_TAG=$(git tag --sort=-version:refname \
+                         | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+                         | grep -v "^${GITHUB_REF_NAME}\$" \
+                         | head -n 1 || true)
+            if [ -n "$PREV_TAG" ]; then
+              RANGE="${PREV_TAG}..${GITHUB_REF_NAME}"
+              HEADING="What's new in ${GITHUB_REF_NAME}"
+            else
+              RANGE="${GITHUB_REF_NAME}"
+              HEADING="Humdrum ${GITHUB_REF_NAME}"
+            fi
+            {
+              echo "## ${HEADING}"
+              echo ""
+              git log "$RANGE" --no-merges --pretty=format:'%s' \
+                | grep -vE '^(fix\(release\)|fix\(ci\)|chore\(release\)|chore\(ci\))' \
+                | sed 's/^/- /' \
+                | head -n 30
+              echo ""
+              echo ""
+              echo "**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/commits/${GITHUB_REF_NAME}"
+            } > /tmp/release_notes.md
           fi
-          {
-            echo "## ${HEADING}"
-            echo ""
-            git log "$RANGE" --no-merges --pretty=format:'%s' \
-              | grep -vE '^(fix\(release\)|fix\(ci\)|chore\(release\)|chore\(ci\))' \
-              | sed 's/^/- /' \
-              | head -n 30
-            echo ""
-            echo ""
-            echo "**Full Changelog**: https://github.com/${GITHUB_REPOSITORY}/commits/${GITHUB_REF_NAME}"
-          } > /tmp/release_notes.md
-          echo "--- Generated notes ---"
+          echo "--- Final notes ---"
           cat /tmp/release_notes.md
 
       - name: Publish GitHub Release
