@@ -1,27 +1,34 @@
 <?xml version='1.0' encoding='utf-8'?>
 <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
   <channel>
-    <item><title>Version 0.2.0</title><pubDate>Mon, 27 Apr 2026 03:11:41 +0000</pubDate><sparkle:version>21.0</sparkle:version><sparkle:shortVersionString>0.2.0</sparkle:shortVersionString><description>&lt;h3&gt;Humdrum v0.2.0&lt;/h3&gt;
-&lt;ul&gt;
-  &lt;li&gt;docs: README accuracy pass + auto-generate release notes&lt;/li&gt;
-  &lt;li&gt;fix(mutter): PTT reliability — long holds, races, finalize feedback&lt;/li&gt;
-  &lt;li&gt;Mutter: PTT to Carbon, pause/escape, diagnostics, corrections, wake re-warm&lt;/li&gt;
-  &lt;li&gt;Mutter: push-to-talk activation mode&lt;/li&gt;
-  &lt;li&gt;Mutter: pause (⌥P) and escape-to-cancel with red flash&lt;/li&gt;
-  &lt;li&gt;Diff-paste at phase 1, keep listening through phase 2&lt;/li&gt;
-  &lt;li&gt;feat(mutter): orb polish — phase-1 commit, speech-gated dots, breathing&lt;/li&gt;
-  &lt;li&gt;chore: adversarial review notes from overnight pass&lt;/li&gt;
-  &lt;li&gt;feat(mutter): pivot to commit-once paste cadence&lt;/li&gt;
-  &lt;li&gt;feat: accumulated UI + state polish since v0.2.0&lt;/li&gt;
-  &lt;li&gt;feat(core): add FuzzyMatcher utility with tests&lt;/li&gt;
-  &lt;li&gt;chore: refresh app icon assets and generator&lt;/li&gt;
-  &lt;li&gt;Flip paste cascade to clipboard-first; fix pastedText advance bug; restore recorder drag&lt;/li&gt;
-  &lt;li&gt;v0.2.0 rebuild: HumdrumCore library + keystroke-first paste cascade&lt;/li&gt;
-  &lt;li&gt;Add Sparkle config to Info.plist&lt;/li&gt;
-  &lt;li&gt;Rename to Humdrum; add auto-save, move-to-Applications, notarized release pipeline&lt;/li&gt;
-  &lt;li&gt;Initial commit: MeetingScribe app&lt;/li&gt;
-&lt;/ul&gt;
-&lt;p&gt;&lt;strong&gt;Full Changelog&lt;/strong&gt;: &lt;a href="https://github.com/aaronjellis/Humdrum/commits/v0.2.0"&gt;https://github.com/aaronjellis/Humdrum/commits/v0.2.0&lt;/a&gt;&lt;/p&gt;</description><enclosure sparkle:edSignature="QURQOA+jX6h1d/jJ78YxEPxs6/WpQngt71ErAKDoiF7e2r8ajTtFFK8GivLdDhLn/rGVoeumLNujRClH+4PhAQ==" length="139051455" url="https://github.com/aaronjellis/Humdrum/releases/download/v0.2.0/Humdrum.zip" type="application/octet-stream" /></item><title>Humdrum Updates</title>
+    <item><title>Version 0.2.1</title><pubDate>Mon, 27 Apr 2026 03:42:12 +0000</pubDate><sparkle:version>0.2.1</sparkle:version><sparkle:shortVersionString>0.2.1</sparkle:shortVersionString><description><![CDATA[<h3>What&#x27;s new in v0.2.1</h3>
+<p>A small polish release after v0.2.0.</p>
+<ul>
+  <li><strong>One version, clearly displayed.</strong> The About box (App menu → About Humdrum) now shows a single version number instead of <em>&quot;Version 0.2.0 (21.0)&quot;</em> with two confusing numbers side by side. The sidebar in the main window also reads from the bundle automatically — previously it held a hand-typed &quot;v0.1.0&quot; left over from before the project was renamed to Humdrum.</li>
+  <li><strong>Reliable auto-updates.</strong> The Sparkle update pipeline that v0.2.0 introduced is now battle-tested end-to-end. <strong>App menu → Check for Updates…</strong> lands cleanly, including the case where some v0.2.0 installs hit a spurious &quot;Update Error&quot; on first install.</li>
+</ul>
+<p>---</p>
+<p><strong>Full Changelog</strong>: <a href="https://github.com/aaronjellis/Humdrum/commits/v0.2.1">https://github.com/aaronjellis/Humdrum/commits/v0.2.1</a></p>]]></description><enclosure sparkle:edSignature="TJ6WjVQ9XMLb1bJm/8M1Bt2Q3/S2EGjEhlpUo3jPWzgRFKa8Wxl+23AF755imZ9dJBRcMn4qK4UQUQb3wGBEDg==" length="139051612" url="https://github.com/aaronjellis/Humdrum/releases/download/v0.2.1/Humdrum.zip" type="application/octet-stream" /></item><item><title>Version 0.2.0</title><pubDate>Mon, 27 Apr 2026 03:11:41 +0000</pubDate><sparkle:version>21.0</sparkle:version><sparkle:shortVersionString>0.2.0</sparkle:shortVersionString><description><h3>Humdrum v0.2.0</h3>
+<ul>
+  <li>docs: README accuracy pass + auto-generate release notes</li>
+  <li>fix(mutter): PTT reliability — long holds, races, finalize feedback</li>
+  <li>Mutter: PTT to Carbon, pause/escape, diagnostics, corrections, wake re-warm</li>
+  <li>Mutter: push-to-talk activation mode</li>
+  <li>Mutter: pause (⌥P) and escape-to-cancel with red flash</li>
+  <li>Diff-paste at phase 1, keep listening through phase 2</li>
+  <li>feat(mutter): orb polish — phase-1 commit, speech-gated dots, breathing</li>
+  <li>chore: adversarial review notes from overnight pass</li>
+  <li>feat(mutter): pivot to commit-once paste cadence</li>
+  <li>feat: accumulated UI + state polish since v0.2.0</li>
+  <li>feat(core): add FuzzyMatcher utility with tests</li>
+  <li>chore: refresh app icon assets and generator</li>
+  <li>Flip paste cascade to clipboard-first; fix pastedText advance bug; restore recorder drag</li>
+  <li>v0.2.0 rebuild: HumdrumCore library + keystroke-first paste cascade</li>
+  <li>Add Sparkle config to Info.plist</li>
+  <li>Rename to Humdrum; add auto-save, move-to-Applications, notarized release pipeline</li>
+  <li>Initial commit: MeetingScribe app</li>
+</ul>
+<p><strong>Full Changelog</strong>: <a href="https://github.com/aaronjellis/Humdrum/commits/v0.2.0">https://github.com/aaronjellis/Humdrum/commits/v0.2.0</a></p></description><enclosure sparkle:edSignature="QURQOA+jX6h1d/jJ78YxEPxs6/WpQngt71ErAKDoiF7e2r8ajTtFFK8GivLdDhLn/rGVoeumLNujRClH+4PhAQ==" length="139051455" url="https://github.com/aaronjellis/Humdrum/releases/download/v0.2.0/Humdrum.zip" type="application/octet-stream" /></item><title>Humdrum Updates</title>
     <link>https://github.com/aaronjellis/Humdrum</link>
     <description>Latest Humdrum releases.</description>
     <language>en</language>
