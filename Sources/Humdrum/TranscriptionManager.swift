@@ -233,6 +233,16 @@ final class TranscriptionManager: ObservableObject {
     private var transcriptionTask: Task<Void, Never>?
     private var timerTask: Task<Void, Never>?
     private var levelTask: Task<Void, Never>?
+    private var watchdogTask: Task<Void, Never>?
+    private var configChangeObserver: NSObjectProtocol?
+    /// Timestamp of the last in-place engine restart attempt. Used to
+    /// distinguish "config change fired but the engine recovered or
+    /// stayed running" from "config change fires repeatedly within the
+    /// same second" — the latter signals genuine sustained
+    /// reconfiguration (active AirPlay routing, hotplug churn) where a
+    /// retry is futile. In that case we surface a status message and
+    /// stop instead of fighting the OS.
+    private var lastConfigRestartAt: Date?
     private var commitSampleIndex: Int = 0
     private var startedAt: Date?
     private var loadedModelId: String?
@@ -405,12 +415,20 @@ final class TranscriptionManager: ObservableObject {
     // MARK: Recording lifecycle
 
     func start() async {
+        Diagnostics.engine.info(
+            "recording.start.requested modelLoaded=\(self.modelLoaded, privacy: .public) isRecording=\(self.isRecording, privacy: .public) isLoadingModel=\(self.isLoadingModel, privacy: .public) liveTx=\(self.liveTranscriptionEnabled, privacy: .public)"
+        )
         guard modelLoaded else {
+            Diagnostics.engine.error("recording.start.refused reason=model_not_loaded")
             status = "Model not loaded yet."
             return
         }
-        guard !isRecording else { return }
+        guard !isRecording else {
+            Diagnostics.engine.notice("recording.start.refused reason=already_recording")
+            return
+        }
         guard !isLoadingModel else {
+            Diagnostics.engine.notice("recording.start.refused reason=loading_model")
             status = "Still loading model…"
             return
         }
@@ -422,12 +440,14 @@ final class TranscriptionManager: ObservableObject {
         // it completes in a few hundred ms, which is invisible to the
         // user compared to the old behavior of blocking at `stop()`.
         if let prior = lastFinalizeTask {
+            Diagnostics.engine.info("recording.start.awaiting_prior_finalize")
             status = "Wrapping up last session…"
             _ = await prior.value
         }
 
         let granted = await ensureMicrophoneAccess()
         guard granted else {
+            Diagnostics.permissions.error("recording.start.refused reason=mic_denied")
             status = "Microphone access denied. Open System Settings → Privacy & Security → Microphone, enable Humdrum, then try again. If it isn't listed, run: tccutil reset Microphone com.aaronellis.humdrum"
             return
         }
@@ -465,13 +485,35 @@ final class TranscriptionManager: ObservableObject {
             }
             startTimerLoop()
             startLevelLoop()
+            startStallWatchdog()
+            lastConfigRestartAt = nil
+            installAudioConfigChangeObserver(on: processor.audioEngine)
+            // Probe AVAudioEngine state immediately after start so we
+            // can tell from a log whether the tap was wired up (engine
+            // running, input format reporting a real sample rate +
+            // channel count) versus the silent-failure case where
+            // start() succeeded but no frames will ever flow.
+            let engineRunning = processor.audioEngine?.isRunning ?? false
+            let inputFmt = processor.audioEngine?.inputNode.inputFormat(forBus: 0)
+            Diagnostics.engine.info(
+                "recording.start.ok device=\(self.selectedInputDeviceID.map(String.init) ?? "default", privacy: .public) liveTx=\(self.liveTranscriptionEnabled, privacy: .public) noiseFilter=\(self.noiseFilterLevel.rawValue, privacy: .public) engineRunning=\(engineRunning, privacy: .public) inputSampleRate=\(inputFmt?.sampleRate ?? 0, privacy: .public) inputChannels=\(inputFmt?.channelCount ?? 0, privacy: .public)"
+            )
         } catch {
+            Diagnostics.engine.error(
+                "recording.start.failed err=\(error.localizedDescription, privacy: .public)"
+            )
             status = "Could not start mic: \(error.localizedDescription). Grant microphone permission in System Settings → Privacy & Security → Microphone."
         }
     }
 
     func stop() async {
-        guard isRecording else { return }
+        guard isRecording else {
+            Diagnostics.engine.notice("recording.stop.refused reason=not_recording")
+            return
+        }
+        Diagnostics.engine.info(
+            "recording.stop.requested elapsedSec=\(self.elapsedSeconds, privacy: .public) commits=\(self.commits.count, privacy: .public) confirmedChars=\(self.confirmedText.count, privacy: .public)"
+        )
 
         // Tear down the LIVE pipeline immediately so the UI gate
         // (`isBusy`) flips false and the user can start a new session
@@ -480,9 +522,15 @@ final class TranscriptionManager: ObservableObject {
         transcriptionTask?.cancel()
         timerTask?.cancel()
         levelTask?.cancel()
+        watchdogTask?.cancel()
         transcriptionTask = nil
         timerTask = nil
         levelTask = nil
+        watchdogTask = nil
+        if let obs = configChangeObserver {
+            NotificationCenter.default.removeObserver(obs)
+            configChangeObserver = nil
+        }
         audioProcessor?.stopRecording()
         audioLevels = [0, 0, 0]
         currentRMS = 0
@@ -804,9 +852,15 @@ final class TranscriptionManager: ObservableObject {
         transcriptionTask?.cancel()
         timerTask?.cancel()
         levelTask?.cancel()
+        watchdogTask?.cancel()
         transcriptionTask = nil
         timerTask = nil
         levelTask = nil
+        watchdogTask = nil
+        if let obs = configChangeObserver {
+            NotificationCenter.default.removeObserver(obs)
+            configChangeObserver = nil
+        }
         audioProcessor?.stopRecording()
         audioLevels = [0, 0, 0]
         currentRMS = 0
@@ -853,10 +907,25 @@ final class TranscriptionManager: ObservableObject {
             // Per-circle smoothing (alpha for an exponential moving average).
             // Circle 1 reacts quickly; Circle 3 slowly — creates the chase.
             let alphas: [Float] = [0.55, 0.30, 0.16]
+            // One-shot diagnostic flags so we log a single line each
+            // time the audio buffer first gains samples and the first
+            // time RMS exceeds the noise floor — pinpoints whether
+            // AVAudioEngine actually delivered frames after a `.ok`
+            // start, without spamming the log every 33 ms tick.
+            var loggedFirstSamples = false
+            var loggedFirstAudible = false
+            let startedTickAt = Date()
             while !Task.isCancelled, let self, self.isRecording {
                 if let processor = self.audioProcessor {
                     let samples = processor.audioSamples
                     let windowSize = self.sampleRate / 20   // 50 ms
+                    if !loggedFirstSamples && !samples.isEmpty {
+                        let waitMs = Int(Date().timeIntervalSince(startedTickAt) * 1000)
+                        Diagnostics.engine.info(
+                            "audio.first_samples count=\(samples.count, privacy: .public) afterMs=\(waitMs, privacy: .public)"
+                        )
+                        loggedFirstSamples = true
+                    }
                     if samples.count >= windowSize {
                         let tail = samples.suffix(windowSize)
                         var sumSq: Float = 0
@@ -867,6 +936,12 @@ final class TranscriptionManager: ObservableObject {
                         // speech/silence against real mic levels rather
                         // than the boosted visualizer ones.
                         self.currentRMS = rms
+                        if !loggedFirstAudible && rms >= 0.005 {
+                            Diagnostics.engine.info(
+                                "audio.first_audible rms=\(rms, privacy: .public) sampleCount=\(samples.count, privacy: .public)"
+                            )
+                            loggedFirstAudible = true
+                        }
                         // Speech RMS is typically ~0.01–0.15; boost to 0…1 range.
                         let normalized = min(1.1, rms * 14)
                         var updated = self.audioLevels
@@ -878,6 +953,159 @@ final class TranscriptionManager: ObservableObject {
                 }
                 try? await Task.sleep(nanoseconds: 33_000_000)
             }
+        }
+    }
+
+    /// Detects "engine running but no audio frames are arriving" — the
+    /// silent failure mode we hit when AVAudioEngine's tap dies without
+    /// surfacing an error. Common triggers: AirPlay starting (system
+    /// reroutes audio), input device unplugged, OS-side mic mute.
+    /// Notification-based recovery via `installAudioConfigChangeObserver`
+    /// catches the explicit cases; this watchdog is the catch-all.
+    ///
+    /// Polls `audioSamples.count` every 3 s. If the count hasn't grown
+    /// across 3 consecutive ticks (~9 s of dead air while we believe
+    /// we're recording), logs `audio.stalled`. Doesn't try to auto-
+    /// recover yet — the goal here is visibility; the user should see
+    /// the failure in logs and we'll add UI surfacing when we have a
+    /// repro to validate against.
+    private func startStallWatchdog() {
+        watchdogTask = Task { @MainActor [weak self] in
+            var lastCount: Int = 0
+            var stagnantTicks: Int = 0
+            var stalledLogged = false
+            while !Task.isCancelled, let self, self.isRecording {
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                guard self.isRecording else { break }
+                let current = self.audioProcessor?.audioSamples.count ?? 0
+                if current > lastCount {
+                    lastCount = current
+                    stagnantTicks = 0
+                    if stalledLogged {
+                        Diagnostics.engine.notice(
+                            "audio.recovered samples=\(current, privacy: .public)"
+                        )
+                        stalledLogged = false
+                    }
+                    continue
+                }
+                stagnantTicks += 1
+                if stagnantTicks >= 3 && !stalledLogged {
+                    let engineRunning = self.audioProcessor?.audioEngine?.isRunning ?? false
+                    Diagnostics.engine.error(
+                        "audio.stalled samples=\(current, privacy: .public) engineRunning=\(engineRunning, privacy: .public) elapsedSec=\(self.elapsedSeconds, privacy: .public)"
+                    )
+                    stalledLogged = true
+                }
+            }
+        }
+    }
+
+    /// Listen for `AVAudioEngineConfigurationChange` on the active
+    /// engine. macOS posts this when audio device routing changes mid-
+    /// recording (AirPlay, device plug/unplug, sample-rate switch).
+    /// AVAudioEngine STOPS itself when this fires, so we have to
+    /// rebuild our recording session if we want to keep capturing.
+    ///
+    /// First pass: log the event, attempt a clean restart by recreating
+    /// the AudioProcessor and re-running the level/transcription loops.
+    /// If the restart fails, the watchdog above will surface a stall
+    /// shortly after.
+    private func installAudioConfigChangeObserver(on engine: AVAudioEngine?) {
+        guard let engine else { return }
+        configChangeObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: engine,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, self.isRecording else { return }
+                // Grace period before deciding the engine is dead.
+                // AVAudioEngine often emits this notification during
+                // normal route negotiation (typically settles within
+                // ~150–250 ms of any engine start, plus on output route
+                // changes), and the engine briefly reports !isRunning
+                // mid-settle before recovering on its own. Forcing a
+                // restart in that window races with the system's own
+                // recovery and produces FormatNotSupported (-10868).
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                guard self.isRecording else { return }
+                self.handleAudioConfigChange()
+            }
+        }
+    }
+
+    /// Config-change handler called *after* the 250 ms grace period in
+    /// the observer block (see `installAudioConfigChangeObserver`).
+    /// By the time we run, the system has had a chance to settle.
+    ///
+    /// Behaviour:
+    ///   • If the existing engine recovered on its own → nothing to do.
+    ///   • If still stopped → recreate the whole AudioProcessor and
+    ///     re-tap. In-place `engine.start()` reliably trips
+    ///     `kAudioUnitErr_FormatNotSupported (-10868)` when the system
+    ///     is still mid-reconfigure; a fresh AVAudioEngine queries the
+    ///     now-settled hardware format and binds against it cleanly.
+    ///   • Cap to one recreate per second so a routing-storm scenario
+    ///     (sustained AirPlay activation, USB hotplug churn) doesn't
+    ///     produce an infinite loop. Second failure → give up and
+    ///     surface the failure pill.
+    private func handleAudioConfigChange() {
+        guard let oldEngine = audioProcessor?.audioEngine else { return }
+
+        // Engine self-recovered — typical when the change is purely
+        // output-side (BT speaker swap, headphone jack, etc.).
+        if oldEngine.isRunning {
+            return
+        }
+
+        // Already restarted recently — assume sustained reconfig and
+        // bail rather than thrash.
+        if let last = lastConfigRestartAt, Date().timeIntervalSince(last) < 1.0 {
+            Diagnostics.engine.error(
+                "audio.configChange — engine stopped again within 1 s; giving up"
+            )
+            stopWithStatusMessage("Audio devices changed — recording stopped.")
+            return
+        }
+        lastConfigRestartAt = Date()
+
+        Diagnostics.engine.error(
+            "audio.configChange — engine stopped, recreating audio processor"
+        )
+
+        audioProcessor?.stopRecording()
+        let processor = AudioProcessor()
+        self.audioProcessor = processor
+        do {
+            try processor.startRecordingLive(inputDeviceID: selectedInputDeviceID) { _ in }
+            // Re-install the observer on the NEW engine — the old
+            // observer is bound to a now-defunct engine instance and
+            // will never fire again. Clear it explicitly first to
+            // avoid leaking observers across recreations.
+            if let obs = configChangeObserver {
+                NotificationCenter.default.removeObserver(obs)
+                configChangeObserver = nil
+            }
+            installAudioConfigChangeObserver(on: processor.audioEngine)
+            Diagnostics.engine.info("audio.configChange.restarted")
+        } catch {
+            Diagnostics.engine.error(
+                "audio.configChange.restartFailed err=\(error.localizedDescription, privacy: .public)"
+            )
+            stopWithStatusMessage("Audio devices changed — recording stopped.")
+        }
+    }
+
+    /// Sets a status string the recorder widget surfaces, then stops
+    /// recording on the main actor. Called on irrecoverable audio
+    /// errors (config change loop, hardware unplug). Uses `stop()`
+    /// rather than `cancel()` so any audio captured before the failure
+    /// gets finalized + saved as a session.
+    private func stopWithStatusMessage(_ message: String) {
+        status = message
+        Task { @MainActor [weak self] in
+            await self?.stop()
         }
     }
 
@@ -926,13 +1154,23 @@ final class TranscriptionManager: ObservableObject {
             let hitMax = windowDuration >= commitThresholds.maxSegmentSeconds
 
             if !text.isEmpty && ((tailSilent && longEnough) || hitMax) {
+                let reason = hitMax ? "hitMax" : "tailSilent"
+                Diagnostics.engine.info(
+                    "runStep.commit chars=\(text.count, privacy: .public) windowSec=\(windowDuration, privacy: .public) reason=\(reason, privacy: .public)"
+                )
                 appendCommit(text: text, endingSampleIndex: allSamples.count)
                 commitSampleIndex = allSamples.count
                 hypothesisText = ""
                 renderConfirmedText()
             }
+        } catch is CancellationError {
+            // Normal at end-of-recording — the loop's transcribe call
+            // is cancelled when the user (or coordinator) calls stop().
+            // Don't escalate that to an error in the log.
         } catch {
-            // transient; try again next tick
+            Diagnostics.engine.error(
+                "runStep.transcribe.failed err=\(error.localizedDescription, privacy: .public)"
+            )
         }
     }
 

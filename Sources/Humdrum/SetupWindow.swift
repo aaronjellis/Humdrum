@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import HumdrumCore
+import WhisperKit  // for the DeviceID typealias used by the mic picker
 
 /// Pre-meeting setup. A small, visually engaging window where the user
 /// picks quality/noise/speakers with icon tiles instead of dropdowns,
@@ -11,32 +12,54 @@ struct SetupWindow: View {
     @Environment(\.openWindow) private var openWindow
     @Environment(\.dismissWindow) private var dismissWindow
 
-    @State private var advancedExpanded: Bool = false
     @State private var starting: Bool = false
+    @State private var diarizationDownload: DiarizationDownloadState = .idle
+
+    /// State machine for the diarization-model download triggered when
+    /// the user enables speaker labels. Driven by FluidAudio's
+    /// `DiarizerModels.downloadIfNeeded(progressHandler:)`. The download
+    /// is idempotent on disk — calling when files are already cached
+    /// resolves immediately, which lands us in `.ready` after a single
+    /// progressHandler call at fractionCompleted=1.
+    enum DiarizationDownloadState: Equatable {
+        case idle
+        case downloading(progress: Double)
+        case ready
+        case failed(String)
+
+        var isInFlight: Bool {
+            if case .downloading = self { return true }
+            return false
+        }
+    }
 
     var body: some View {
         ZStack {
             AppTheme.background.ignoresSafeArea()
 
-            ScrollView {
-                VStack(alignment: .leading, spacing: 22) {
-                    header
-                    qualitySection
-                    noiseSection
-                    speakersSection
-                    advancedSection
-                }
-                .padding(.horizontal, 28)
-                .padding(.top, 18)
-                .padding(.bottom, 24)
+            // Single non-scrolling column. Sections are sized to fit
+            // the default window without scrolling — quick glance,
+            // pick, hit Start. The in-content header is gone (the
+            // macOS title bar already says "New Recording", which is
+            // configured at the WindowGroup level).
+            VStack(alignment: .leading, spacing: 14) {
+                micSection
+                qualitySection
+                noiseSection
+                speakersRow
+                nameHintsField
+                Spacer(minLength: 0)
             }
+            .padding(.horizontal, 24)
+            .padding(.top, 18)
+            .padding(.bottom, 64)   // leave room above the sticky footer
 
             VStack {
                 Spacer()
                 footerBar
             }
         }
-        .frame(minWidth: 560, idealWidth: 580, minHeight: 620)
+        .frame(minWidth: 560, idealWidth: 580, minHeight: 720)
         .preferredColorScheme(.dark)
         // Reset the `starting` guard every time the window appears.
         //
@@ -47,43 +70,122 @@ struct SetupWindow: View {
         // error, user force-quit mid-load), the next time the user
         // opens Setup the Start button is stuck disabled. Resetting
         // on appear scopes the guard to a single Start press.
-        .onAppear { starting = false }
+        .onAppear {
+            starting = false
+            manager.refreshInputDevices()
+        }
+        // If the user has speakers ON when Setup opens (from a prior
+        // session, or persisted across launches), kick off the model
+        // download check immediately so the Start button isn't gated
+        // by a download that hasn't started yet.
+        .task(id: manager.speakerLabelsEnabled) {
+            if manager.speakerLabelsEnabled {
+                await ensureDiarizationModels()
+            } else {
+                diarizationDownload = .idle
+            }
+        }
+    }
+
+    // MARK: Diarization download
+
+    /// Triggered the first time the user flips speakers ON in this Setup
+    /// session (or re-opens Setup with it already on). Calls FluidAudio's
+    /// idempotent download API and renders progress into the speakers row.
+    /// While in flight, the Start button is disabled — submitting before
+    /// the model is on disk would force the recorder to do the download
+    /// during Stop, which is exactly the ambiguous "stuck" UX we want to
+    /// avoid.
+    private func ensureDiarizationModels() async {
+        if case .ready = diarizationDownload { return }
+        if diarizationDownload.isInFlight { return }
+        diarizationDownload = .downloading(progress: 0)
+        do {
+            try await DiarizationService.downloadModelsIfNeeded { fraction in
+                Task { @MainActor in
+                    // Only update if we're still in the downloading state —
+                    // protects against late callbacks after the user
+                    // flipped the toggle off and we re-set to .idle.
+                    if case .downloading = diarizationDownload {
+                        diarizationDownload = .downloading(progress: fraction)
+                    }
+                }
+            }
+            diarizationDownload = .ready
+        } catch {
+            diarizationDownload = .failed(error.localizedDescription)
+        }
     }
 
     // MARK: Header
 
-    private var header: some View {
+    // MARK: Microphone
+
+    /// Compact input-device picker. Drives `manager.selectedInputDeviceID`,
+    /// which `manager.start()` passes to `AudioProcessor.startRecordingLive`.
+    /// Without this UI the user had no way to override the system default
+    /// — meaning a Bluetooth headset that's paired but unworn would
+    /// silently feed zero-valued samples into Whisper, with no UX recourse.
+    private var micSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 10) {
-                ZStack {
-                    Circle()
-                        .fill(
-                            RadialGradient(
-                                colors: [AppTheme.accent, AppTheme.accent.opacity(0.3)],
-                                center: .center, startRadius: 2, endRadius: 16)
-                        )
-                        .frame(width: 24, height: 24)
-                        .shadow(color: AppTheme.accentGlow, radius: 8)
-                    Image(systemName: "mic.fill")
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(.white)
+            sectionLabel("Microphone")
+            HStack(spacing: 8) {
+                Image(systemName: "mic")
+                    .font(.system(size: 12))
+                    .foregroundStyle(AppTheme.textSecondary)
+                Picker("", selection: micPickerBinding) {
+                    Text("System default").tag(DeviceID?.none)
+                    if !manager.availableInputDevices.isEmpty {
+                        Divider()
+                        ForEach(manager.availableInputDevices) { dev in
+                            Text(dev.name).tag(DeviceID?.some(dev.id))
+                        }
+                    }
                 }
-                Text("New Recording")
-                    .font(.system(size: 22, weight: .semibold))
-                    .foregroundStyle(AppTheme.textPrimary)
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .controlSize(.small)
+                .tint(AppTheme.textPrimary)
+
+                Button { manager.refreshInputDevices() } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(AppTheme.textSecondary)
+                        .padding(6)
+                }
+                .buttonStyle(.plain)
+                .help("Re-scan input devices")
             }
-            Text("Pick how you want the transcript to behave, then start when you're ready.")
-                .font(.system(size: 12))
-                .foregroundStyle(AppTheme.textSecondary)
+            .padding(8)
+            .background(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(AppTheme.panel)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(AppTheme.border, lineWidth: 0.5)
+            )
         }
+    }
+
+    /// Tiny shim so the SwiftUI `Picker` can bind to an optional
+    /// DeviceID. SwiftUI's tagged Pickers handle optionals with
+    /// matching tag types; we're explicit about the bridge so the
+    /// "System default" sentinel (.none) round-trips cleanly through
+    /// the manager's `selectedInputDeviceID` setter.
+    private var micPickerBinding: Binding<DeviceID?> {
+        Binding(
+            get: { manager.selectedInputDeviceID },
+            set: { manager.selectedInputDeviceID = $0 }
+        )
     }
 
     // MARK: Quality
 
     private var qualitySection: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 6) {
             sectionLabel("Quality")
-            HStack(spacing: 10) {
+            HStack(spacing: 8) {
                 ForEach(QualityLevel.allCases) { q in
                     IconTile(
                         icon: iconForQuality(q),
@@ -98,14 +200,9 @@ struct SetupWindow: View {
                     .opacity(manager.isBusy && manager.qualityLevel != q ? 0.4 : 1)
                 }
             }
-            Text(manager.qualityLevel.description)
-                .font(.system(size: 11))
-                .foregroundStyle(AppTheme.textTertiary)
-                .fixedSize(horizontal: false, vertical: true)
-                .padding(.top, 2)
-
-            // Selected-quality download summary, spelled out so nothing
-            // happens silently when the user hits Start.
+            // Single-line "what'll happen on Start" line — replaces the
+            // longer per-level paragraph that used to live here. The
+            // per-level blurb already shows on the tile itself.
             downloadSummary
         }
     }
@@ -166,9 +263,9 @@ struct SetupWindow: View {
     // MARK: Noise
 
     private var noiseSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 6) {
             sectionLabel("Noise filter")
-            HStack(spacing: 10) {
+            HStack(spacing: 8) {
                 ForEach(NoiseFilterLevel.allCases) { lvl in
                     IconTile(
                         icon: iconForNoise(lvl),
@@ -180,11 +277,9 @@ struct SetupWindow: View {
                     )
                 }
             }
-            Text(manager.noiseFilterLevel.description)
-                .font(.system(size: 11))
-                .foregroundStyle(AppTheme.textTertiary)
-                .fixedSize(horizontal: false, vertical: true)
-                .padding(.top, 2)
+            // The per-level blurb on the tile itself ("Recommended" /
+            // "Skip silence" / etc) is enough — dropped the verbose
+            // paragraph that used to live here.
         }
     }
 
@@ -208,149 +303,145 @@ struct SetupWindow: View {
 
     // MARK: Speakers
 
-    private var speakersSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            sectionLabel("Speakers")
-
-            Button { manager.speakerLabelsEnabled.toggle() } label: {
-                VStack(spacing: 10) {
-                    HStack(spacing: 14) {
-                        ZStack {
-                            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                                .fill(
-                                    manager.speakerLabelsEnabled
-                                    ? AppTheme.accentSoft
-                                    : AppTheme.panelElevated
-                                )
-                                .frame(width: 44, height: 44)
-                            Image(systemName: "person.2.fill")
-                                .font(.system(size: 16, weight: .semibold))
-                                .foregroundStyle(
-                                    manager.speakerLabelsEnabled
-                                    ? AppTheme.accent
-                                    : AppTheme.textSecondary
-                                )
-                        }
-
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Label speakers after recording")
-                                .font(.system(size: 13, weight: .semibold))
-                                .foregroundStyle(AppTheme.textPrimary)
-                            Text("Off by default. Transcript appears instantly with no labels; a local diarization model runs in the background and rewrites it with Speaker 1 / 2 / 3 tags.")
-                                .font(.system(size: 11))
-                                .foregroundStyle(AppTheme.textTertiary)
-                                .fixedSize(horizontal: false, vertical: true)
-                                .multilineTextAlignment(.leading)
-                        }
-
-                        Spacer(minLength: 0)
-
-                        Toggle("", isOn: $manager.speakerLabelsEnabled)
-                            .toggleStyle(.switch)
-                            .tint(AppTheme.accent)
-                            .labelsHidden()
-                    }
-
-                    // Explicit consent block — only visible when ON.
-                    if manager.speakerLabelsEnabled {
-                        downloadConsentNote
-                    }
-                }
-                .padding(14)
-                .background(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(AppTheme.panel)
+    /// Compact one-row toggle. Used to be a tall card; now the same row
+    /// surfaces the speaker-model cache state (`Cached` / `~80 MB`),
+    /// flips into a progress bar while downloading, and lands on
+    /// `Ready ✓` when complete. Mirrors the `cacheState` pattern used
+    /// by the Quality tiles so users see one consistent "model status"
+    /// affordance everywhere a download might be required.
+    private var speakersRow: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "person.2.fill")
+                .font(.system(size: 13))
+                .foregroundStyle(
+                    manager.speakerLabelsEnabled ? AppTheme.accent : AppTheme.textSecondary
                 )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .stroke(
-                            manager.speakerLabelsEnabled ? AppTheme.accentBorder : AppTheme.border,
-                            lineWidth: 0.7
-                        )
-                )
-            }
-            .buttonStyle(.plain)
-        }
-    }
+                .frame(width: 18)
 
-    /// Surfaces the fact that enabling Speakers means downloading an
-    /// additional ~80 MB of local ML models (pyannote segmentation +
-    /// speaker embeddings) the first time this recording Stops. Everything
-    /// runs on-device after that.
-    private var downloadConsentNote: some View {
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: "arrow.down.circle.fill")
-                .font(.system(size: 12))
-                .foregroundStyle(AppTheme.accent)
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Downloads a separate package on first use")
-                    .font(.system(size: 11, weight: .semibold))
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Label speakers after recording")
+                    .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(AppTheme.textPrimary)
-                Text("~80 MB of voice-embedding models (pyannote + speaker ID) from Hugging Face, saved to ~/Library/Caches. After that it's 100% offline and never re-downloaded.")
-                    .font(.system(size: 10.5))
-                    .foregroundStyle(AppTheme.textSecondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .multilineTextAlignment(.leading)
+                speakerModelStatusLine
             }
 
             Spacer(minLength: 0)
+
+            Toggle("", isOn: $manager.speakerLabelsEnabled)
+                .toggleStyle(.switch)
+                .tint(AppTheme.accent)
+                .labelsHidden()
+                .controlSize(.small)
         }
         .padding(10)
         .background(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(AppTheme.accentSoft)
+                .fill(AppTheme.panel)
         )
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(AppTheme.accentBorder, lineWidth: 0.5)
+                .stroke(
+                    manager.speakerLabelsEnabled ? AppTheme.accentBorder : AppTheme.border,
+                    lineWidth: 0.5
+                )
         )
     }
 
-    // MARK: Advanced
-
-    private var advancedSection: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            sectionLabel("Advanced")
-            DisclosureGroup(isExpanded: $advancedExpanded) {
-                VStack(alignment: .leading, spacing: 6) {
-                    TextField(
-                        "e.g. Aaron Ellis, Anthropic, Project Zephyr, Dr. Patel",
-                        text: $manager.vocabularyHints
-                    )
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 12))
-                    .padding(9)
-                    .background(
-                        RoundedRectangle(cornerRadius: 7, style: .continuous)
-                            .fill(AppTheme.codeBlock)
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 7, style: .continuous)
-                            .stroke(AppTheme.border, lineWidth: 0.5)
-                    )
-
-                    Text("Optional. Seed the model with proper nouns, brand names, or jargon. Skip this if you don't need it.")
-                        .font(.system(size: 11))
-                        .foregroundStyle(AppTheme.textTertiary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                .padding(.top, 6)
-            } label: {
-                HStack(spacing: 8) {
-                    Image(systemName: "text.quote")
-                        .foregroundStyle(AppTheme.textSecondary)
-                    Text("Name hints")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(AppTheme.textSecondary)
-                    Text("optional")
-                        .font(.system(size: 10))
-                        .foregroundStyle(AppTheme.textTertiary)
-                }
+    /// One-line status under the speakers toggle. Drives the same
+    /// affordance the Quality tiles use for cache state, but rendered
+    /// inline (no IconTile shape — there's only one item) and with an
+    /// integrated progress bar when a download is in flight. Order of
+    /// precedence: in-flight download wins over cached/idle copy.
+    @ViewBuilder
+    private var speakerModelStatusLine: some View {
+        switch diarizationDownload {
+        case .downloading(let progress):
+            HStack(spacing: 6) {
+                ProgressView(value: progress)
+                    .progressViewStyle(.linear)
+                    .controlSize(.small)
+                    .tint(AppTheme.accent)
+                    .frame(maxWidth: 140)
+                Text("Downloading speaker model — \(Int(progress * 100))%")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(AppTheme.textSecondary)
             }
-            .tint(AppTheme.textSecondary)
+        case .ready:
+            cacheBadge(
+                icon: "checkmark.circle.fill",
+                text: "Speaker model ready",
+                tint: AppTheme.accent
+            )
+        case .failed(let msg):
+            cacheBadge(
+                icon: "exclamationmark.triangle.fill",
+                text: "Download failed: \(msg)",
+                tint: AppTheme.danger
+            )
+        case .idle:
+            // Toggle off, or just-opened with no decision yet.
+            // Distinguish cached vs. needs-download so the user knows
+            // what flipping the toggle on will trigger.
+            if DiarizationService.areModelsCached() {
+                cacheBadge(
+                    icon: "checkmark.circle.fill",
+                    text: "Speaker model cached locally",
+                    tint: AppTheme.accent
+                )
+            } else {
+                cacheBadge(
+                    icon: "arrow.down.circle",
+                    text: "Downloads ~80 MB on first use, then offline forever",
+                    tint: AppTheme.textSecondary
+                )
+            }
         }
-        .padding(.bottom, 88) // leave room above the sticky footer
+    }
+
+    /// Pill-style badge — matches the visual language of the Quality
+    /// tile's `cacheState` indicator so the speakers row reads as a
+    /// peer of the model picker rather than a separate idiom.
+    private func cacheBadge(icon: String, text: String, tint: Color) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: icon)
+                .font(.system(size: 9, weight: .semibold))
+            Text(text)
+                .font(.system(size: 10.5))
+        }
+        .foregroundStyle(tint)
+    }
+
+    // MARK: Name hints
+
+    /// Always-visible single-line text field for the vocabulary prompt.
+    /// Was a DisclosureGroup; that hid the field by default and added
+    /// an extra click for a setting that's actually high-value when the
+    /// recording involves named people, products, or jargon.
+    private var nameHintsField: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                sectionLabel("Names & terms")
+                Text("optional")
+                    .font(.system(size: 10))
+                    .foregroundStyle(AppTheme.textTertiary)
+                    .padding(.bottom, 1)
+            }
+            TextField(
+                "e.g. Aaron Ellis, Anthropic, Project Zephyr, Dr. Patel",
+                text: $manager.vocabularyHints
+            )
+            .textFieldStyle(.plain)
+            .font(.system(size: 12))
+            .padding(9)
+            .background(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(AppTheme.codeBlock)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .stroke(AppTheme.border, lineWidth: 0.5)
+            )
+        }
     }
 
     // MARK: Footer
@@ -372,7 +463,15 @@ struct SetupWindow: View {
             // NOT when the model simply isn't loaded yet (that's the
             // normal idle state on first launch, and the button needs to
             // be clickable so Start can trigger the first load).
-            let inFlight = starting || manager.isBusy
+            //
+            // We also gate on the diarization download: if speakers are
+            // ON and that model isn't ready yet, kicking off recording
+            // would force the download to happen during Stop instead,
+            // which is the ambiguous "stuck" UX we wanted to avoid.
+            let diarizationGate = manager.speakerLabelsEnabled
+                && diarizationDownload != .ready
+                && DiarizationService.areModelsCached() == false
+            let inFlight = starting || manager.isBusy || diarizationGate
             Button(action: startRecording) {
                 HStack(spacing: 9) {
                     if inFlight {
@@ -436,9 +535,14 @@ struct SetupWindow: View {
             return "Starting…"
         }
         if let reason = manager.busyReason { return reason }
+        if manager.speakerLabelsEnabled && diarizationDownload.isInFlight {
+            if case .downloading(let progress) = diarizationDownload {
+                return "Downloading speaker model — \(Int(progress * 100))%"
+            }
+            return "Downloading speaker model…"
+        }
         // The model only (re)loads if the picked Quality differs from
         // what's currently cached — usually zero wait after first launch.
-        if manager.needsReload { return "Start Recording" }
         return "Start Recording"
     }
 

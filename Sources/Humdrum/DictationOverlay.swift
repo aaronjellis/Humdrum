@@ -220,6 +220,13 @@ struct DictationOverlayView: View {
     /// `isFinalizing` flips back to false, paste has already landed
     /// and `pasteOutcome` reflects the current session correctly.
     private var currentStatus: StatusPill.Status? {
+        // Audio failure wins — the orb is about to disappear and the
+        // user needs to know why. Set by the coordinator's
+        // `evaluateAudio()` when it notices the manager stopped
+        // recording underneath it.
+        if let msg = dictation.audioFailureMessage {
+            return .audioFailed(message: msg)
+        }
         if manager.isFinalizing { return .transcribing }
         switch dictation.pasteOutcome {
         case .failed:      return .pasteFailed
@@ -483,6 +490,12 @@ struct StatusPill: View {
         /// on `base.en` for a 25 s hold). Without it, the user sees a
         /// blank orb after release and wonders if anything's happening.
         case transcribing
+        /// Audio capture pipeline failed mid-session — usually an
+        /// AVAudioEngineConfigurationChange we couldn't recover from
+        /// (AirPlay started, hardware unplug, format mismatch). The
+        /// orb tears down without pasting; this pill explains why
+        /// rather than letting the orb silently disappear.
+        case audioFailed(message: String)
 
         var iconName: String {
             switch self {
@@ -490,6 +503,7 @@ struct StatusPill: View {
             case .pasteFailed:          return "exclamationmark.circle.fill"
             case .silentDrop:           return "exclamationmark.circle.fill"
             case .transcribing:         return "waveform"
+            case .audioFailed:          return "mic.slash.fill"
             }
         }
 
@@ -503,6 +517,8 @@ struct StatusPill: View {
                 return "That app didn't take the paste — ⌘V to insert"
             case .transcribing:
                 return "Transcribing…"
+            case .audioFailed(let msg):
+                return msg
             }
         }
 
@@ -511,7 +527,8 @@ struct StatusPill: View {
         /// the other three share. Same shape, same position; the colour
         /// is the disambiguator.
         var isInformational: Bool {
-            self == .transcribing
+            if case .transcribing = self { return true }
+            return false
         }
     }
 
@@ -524,7 +541,7 @@ struct StatusPill: View {
                 .symbolEffect(
                     .variableColor.iterative,
                     options: .repeating,
-                    isActive: status == .transcribing
+                    isActive: { if case .transcribing = status { return true } else { return false } }()
                 )
             Text(status.message)
                 .font(.system(size: 11, weight: .medium))

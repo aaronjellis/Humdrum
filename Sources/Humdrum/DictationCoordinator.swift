@@ -88,6 +88,14 @@ final class DictationCoordinator: ObservableObject {
     /// results) the post-paste AX verification runs.
     @Published private(set) var pasteOutcome: PasteOutcome = .succeeded
 
+    /// Set when the audio capture pipeline fails mid-session and the
+    /// orb has to tear down without ever pasting (AVAudioEngine
+    /// configuration storm, hardware unplug). Cleared at the next
+    /// `start()`. The dictation overlay surfaces this as a failure
+    /// pill so the user knows the orb didn't disappear because they
+    /// did something — the audio device changed under them.
+    @Published private(set) var audioFailureMessage: String? = nil
+
     /// Timestamp of the most recent detected speech. Drives several
     /// things in the overlay:
     ///   • The silence-countdown ring drains over `silenceTimeoutSeconds`
@@ -541,6 +549,7 @@ final class DictationCoordinator: ObservableObject {
 
         sessionGeneration &+= 1
         peakRMSSinceStart = 0
+        audioFailureMessage = nil
 
         pasteOutcome = .succeeded
         lastSpeechTime = nil
@@ -712,6 +721,14 @@ final class DictationCoordinator: ObservableObject {
         /// paste boundary (which in PTT mode is "everything", since
         /// PTT skips the phase-1 mid-session commits).
         case release
+        /// `manager.isRecording` flipped false while the coordinator
+        /// still believed it was dictating. Happens when the audio
+        /// pipeline dies (AVAudioEngineConfigurationChange storm,
+        /// hardware unplug, FormatNotSupported on engine restart).
+        /// Without this case the orb sits up for the full no-speech
+        /// timeout (8 s) before tearing down — visible as "the orb
+        /// stays put while I'm speaking but no text appears."
+        case audioFailed
     }
 
     private func stop(reason: StopReason) async {
@@ -754,23 +771,35 @@ final class DictationCoordinator: ObservableObject {
         // segments cap at 7s so the tail pass finalizes well under
         // a second on the happy path. We'd rather paste whatever
         // confirmedText reads than strand the orb on screen.
-        let snapshot: TranscriptSessionSnapshot? = await withCheckedContinuation {
-            (cont: CheckedContinuation<TranscriptSessionSnapshot?, Never>) in
+        //
+        // Audio-failure fast path: if the manager is already stopped
+        // (audio pipeline died → manager auto-stopped via
+        // `stopWithStatusMessage`), skip the snapshot await entirely.
+        // Calling `manager.stop()` would refuse with "not_recording"
+        // and the onSessionCompleted callback would never fire,
+        // stranding us on the 5 s timeout.
+        let snapshot: TranscriptSessionSnapshot?
+        if reason == .audioFailed || !manager.isRecording {
+            snapshot = nil
+        } else {
+            snapshot = await withCheckedContinuation {
+                (cont: CheckedContinuation<TranscriptSessionSnapshot?, Never>) in
 
-            let latch = SingleResumeLatch<TranscriptSessionSnapshot?>(continuation: cont)
+                let latch = SingleResumeLatch<TranscriptSessionSnapshot?>(continuation: cont)
 
-            let timeout = Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 5_000_000_000)
-                latch.resume(nil)
-            }
+                let timeout = Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 5_000_000_000)
+                    latch.resume(nil)
+                }
 
-            manager.onSessionCompleted = { snap in
-                timeout.cancel()
-                latch.resume(snap)
-            }
+                manager.onSessionCompleted = { snap in
+                    timeout.cancel()
+                    latch.resume(snap)
+                }
 
-            Task { @MainActor [weak self] in
-                await self?.manager.stop()
+                Task { @MainActor [weak self] in
+                    await self?.manager.stop()
+                }
             }
         }
 
@@ -1227,6 +1256,27 @@ final class DictationCoordinator: ObservableObject {
         // at full and reads as "we're holding for you." Tap ⌥P
         // again to resume.
         if isPaused { return }
+
+        // Audio-pipeline died underneath us. The manager auto-stops
+        // when AVAudioEngine fails to recover from a config change
+        // (`stopWithStatusMessage`); without this poll, the orb would
+        // stay up for the full 8 s no-speech timeout while the user
+        // speaks into a dead pipeline. Tear down promptly with a
+        // distinct StopReason so the failure pill can surface the
+        // right copy in the orb.
+        if !manager.isRecording {
+            Diagnostics.dictation.error(
+                "session.audio.failed manager status=\(self.manager.status, privacy: .public)"
+            )
+            // Hard-coded message — `manager.status` races with
+            // AppState's session-completed handler, which often
+            // overwrites the audio-failure copy with something
+            // generic like "Transcript ready." before we read it.
+            // The user wants a stable, accurate message here.
+            audioFailureMessage = "Audio devices changed — recording stopped."
+            Task { await self.stop(reason: .audioFailed) }
+            return
+        }
 
         // Compare against the manager's RAW RMS, not the boosted
         // `audioLevels`. The old code averaged the three boosted +

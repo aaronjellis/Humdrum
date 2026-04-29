@@ -40,6 +40,39 @@ final class DiarizationService {
         self.isReady = true
     }
 
+    /// Bytes-progress download wrapper for the Setup UI. Calling this only
+    /// pulls files to disk (or completes ~instantly if already cached) —
+    /// it doesn't wire up the in-memory `DiarizerManager`. The first
+    /// `prepareIfNeeded()` after a Stop will pick those cached files up
+    /// without a second network round-trip.
+    ///
+    /// `progressHandler` is invoked off the main actor (FluidAudio's
+    /// guarantee) — UI callers should hop back to MainActor inside the
+    /// closure.
+    static func downloadModelsIfNeeded(
+        progressHandler: (@Sendable (Double) -> Void)? = nil
+    ) async throws {
+        let pass: DownloadUtils.ProgressHandler? = progressHandler.map { update in
+            { progress in update(progress.fractionCompleted) }
+        }
+        _ = try await DiarizerModels.downloadIfNeeded(progressHandler: pass)
+    }
+
+    /// Synchronous check for whether the diarization models exist on disk
+    /// already. Used by Setup to render a "Cached" badge before any
+    /// network activity, matching how the Quality tiles surface their
+    /// cache state. Looks for both required `.mlmodelc` directories at
+    /// FluidAudio's default models location — if either is absent, we
+    /// treat the cache as missing (a partial download wouldn't load
+    /// anyway).
+    static func areModelsCached() -> Bool {
+        let dir = DiarizerModels.defaultModelsDirectory()
+        let fm = FileManager.default
+        let segPath = dir.appendingPathComponent(ModelNames.Diarizer.segmentationFile).path
+        let embPath = dir.appendingPathComponent(ModelNames.Diarizer.embeddingFile).path
+        return fm.fileExists(atPath: segPath) && fm.fileExists(atPath: embPath)
+    }
+
     /// Runs diarization on `samples` at 16 kHz mono. Returns speaker-tagged
     /// time ranges. FluidAudio's speakerId strings (e.g. "speaker_0") are
     /// returned as-is; caller is responsible for renumbering them to
