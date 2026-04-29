@@ -1,14 +1,32 @@
 <?xml version='1.0' encoding='utf-8'?>
 <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
   <channel>
-    <item><title>Version 0.2.1</title><pubDate>Mon, 27 Apr 2026 03:42:12 +0000</pubDate><sparkle:version>0.2.1</sparkle:version><sparkle:shortVersionString>0.2.1</sparkle:shortVersionString><description><![CDATA[<h3>What&#x27;s new in v0.2.1</h3>
+    <item><title>Version 0.3.0</title><pubDate>Wed, 29 Apr 2026 20:06:37 +0000</pubDate><sparkle:version>0.3.0</sparkle:version><sparkle:shortVersionString>0.3.0</sparkle:shortVersionString><description><![CDATA[<h3>What&#x27;s new in v0.3.0</h3>
+<p>A reliability-and-UX pass focused on the two recording paths.</p>
+<p>### Meeting recorder</p>
+<ul>
+  <li><strong>Mic picker in Setup.</strong> Pick the input device you&#x27;re recording with directly from the New Recording window — no more relying on the system default. Previously, if a Bluetooth headset was paired but not on your head, recordings would silently capture nothing. Now you can switch to <strong>MacBook Pro Microphone</strong> (or any other input) without leaving the app.</li>
+  <li><strong>Single-screen Setup.</strong> Quality, Noise filter, Speakers, and Names &amp; terms now all fit without scrolling. Faster glance, faster cut.</li>
+  <li><strong>Speaker-label download with live progress.</strong> Toggling &quot;Label speakers after recording&quot; now downloads the diarization model right in the Setup window, with a real progress bar. <strong>Start Recording</strong> stays disabled until the model is on disk — no more starting a recording only to find Stop hangs while a hidden download chases ~80 MB. Same <strong>Cached</strong> badge style you already see on the Quality tiles.</li>
+  <li><strong>Audio-config resilience.</strong> Mid-recording audio routing changes (AirPlay starting, Bluetooth swap, headphone jack) no longer silently kill the capture. The engine recovers automatically; if it can&#x27;t, the recording stops cleanly with a status message telling you why.</li>
+</ul>
+<p>### Mutter (push-to-talk dictation)</p>
+<ul>
+  <li><strong>Survives audio routing storms.</strong> Same recovery pipeline as the meeting recorder. AirPlay starting, BT swaps, output reroutes — all handled without dropping the dictation. The previous behaviour was: orb appears, audio dies silently, orb hangs for the full 8-second no-speech timeout while you wonder why nothing&#x27;s transcribing.</li>
+  <li><strong>Fast audio-failure pill.</strong> When audio capture genuinely fails (input device unplugged, sustained system reconfiguration), the orb tears down within ~200 ms with a clear &quot;Audio devices changed — recording stopped&quot; pill instead of hanging.</li>
+  <li><strong>Single-version display.</strong> The About box now shows just &quot;Version 0.3.0&quot; — no more confusing &quot;(0.2.0)&quot; parenthetical from the old auto-bumped build counter.</li>
+</ul>
+<p>### Under the hood</p>
+<p>If you ever poke at Console for diagnostics, the audio pipeline is now fully instrumented (`audio.first_samples`, `audio.first_audible`, `audio.stalled`, `audio.configChange.*`). Almost every silent-failure mode is now visible in a single `log show` invocation.</p>
+<p>---</p>
+<p><strong>Full Changelog</strong>: <a href="https://github.com/aaronjellis/Humdrum/commits/v0.3.0">https://github.com/aaronjellis/Humdrum/commits/v0.3.0</a></p>]]></description><enclosure sparkle:edSignature="1Nq+d+UPBVzuvm3F4i/wJokXZh5lX9W62TZCpR7cWrGy48uA8M/bDq09PMDSWUNGNb4g2WpbeWj9hnzrUdjQBQ==" length="139071676" url="https://github.com/aaronjellis/Humdrum/releases/download/v0.3.0/Humdrum.zip" type="application/octet-stream" /></item><item><title>Version 0.2.1</title><pubDate>Mon, 27 Apr 2026 03:42:12 +0000</pubDate><sparkle:version>0.2.1</sparkle:version><sparkle:shortVersionString>0.2.1</sparkle:shortVersionString><description><h3>What&#x27;s new in v0.2.1</h3>
 <p>A small polish release after v0.2.0.</p>
 <ul>
   <li><strong>One version, clearly displayed.</strong> The About box (App menu → About Humdrum) now shows a single version number instead of <em>&quot;Version 0.2.0 (21.0)&quot;</em> with two confusing numbers side by side. The sidebar in the main window also reads from the bundle automatically — previously it held a hand-typed &quot;v0.1.0&quot; left over from before the project was renamed to Humdrum.</li>
   <li><strong>Reliable auto-updates.</strong> The Sparkle update pipeline that v0.2.0 introduced is now battle-tested end-to-end. <strong>App menu → Check for Updates…</strong> lands cleanly, including the case where some v0.2.0 installs hit a spurious &quot;Update Error&quot; on first install.</li>
 </ul>
 <p>---</p>
-<p><strong>Full Changelog</strong>: <a href="https://github.com/aaronjellis/Humdrum/commits/v0.2.1">https://github.com/aaronjellis/Humdrum/commits/v0.2.1</a></p>]]></description><enclosure sparkle:edSignature="TJ6WjVQ9XMLb1bJm/8M1Bt2Q3/S2EGjEhlpUo3jPWzgRFKa8Wxl+23AF755imZ9dJBRcMn4qK4UQUQb3wGBEDg==" length="139051612" url="https://github.com/aaronjellis/Humdrum/releases/download/v0.2.1/Humdrum.zip" type="application/octet-stream" /></item><title>Humdrum Updates</title>
+<p><strong>Full Changelog</strong>: <a href="https://github.com/aaronjellis/Humdrum/commits/v0.2.1">https://github.com/aaronjellis/Humdrum/commits/v0.2.1</a></p></description><enclosure sparkle:edSignature="TJ6WjVQ9XMLb1bJm/8M1Bt2Q3/S2EGjEhlpUo3jPWzgRFKa8Wxl+23AF755imZ9dJBRcMn4qK4UQUQb3wGBEDg==" length="139051612" url="https://github.com/aaronjellis/Humdrum/releases/download/v0.2.1/Humdrum.zip" type="application/octet-stream" /></item><title>Humdrum Updates</title>
     <link>https://github.com/aaronjellis/Humdrum</link>
     <description>Latest Humdrum releases.</description>
     <language>en</language>
