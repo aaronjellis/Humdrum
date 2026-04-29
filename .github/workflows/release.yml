@@ -24,7 +24,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0     # build-app.sh reads git history for build number
 
@@ -84,15 +84,35 @@ jobs:
           NOTARY_PROFILE: humdrum-notary
         run: ./build-app.sh
 
-      - name: Install Sparkle tools
+      - name: Install Sparkle sign_update tool
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          brew update
-          brew install --cask sparkle
-          SIGN_UPDATE=$(find /opt/homebrew/Caskroom/sparkle -name sign_update | head -n1)
-          if [ -z "$SIGN_UPDATE" ]; then
-            echo "Failed to locate sign_update after installing sparkle cask" >&2
+          set -euo pipefail
+          # Homebrew's `sparkle` cask was deprecated 2026-09-01 — the
+          # cask itself fails the macOS Gatekeeper check, so it'll be
+          # disabled outright soon. We just need `sign_update` to
+          # ed25519-sign the release zip; pull it straight from the
+          # Sparkle project's GitHub Releases. Querying the API for
+          # the latest tarball URL avoids hard-coding a version that
+          # would rot.
+          URL=$(gh api repos/sparkle-project/Sparkle/releases/latest \
+            --jq '.assets[] | select(.name | test("Sparkle-[0-9.]+\\.tar\\.xz$")) | .browser_download_url' \
+            | head -n 1)
+          if [ -z "$URL" ]; then
+            echo "Could not resolve latest Sparkle tarball URL from GitHub API" >&2
             exit 1
           fi
+          echo "Downloading: $URL"
+          mkdir -p /tmp/sparkle-tools
+          curl -fsSL "$URL" | tar -xJ -C /tmp/sparkle-tools
+          SIGN_UPDATE=$(find /tmp/sparkle-tools -name sign_update -type f | head -n 1)
+          if [ -z "$SIGN_UPDATE" ]; then
+            echo "Failed to locate sign_update inside the downloaded tarball" >&2
+            ls -lR /tmp/sparkle-tools >&2
+            exit 1
+          fi
+          chmod +x "$SIGN_UPDATE"
           echo "SIGN_UPDATE=$SIGN_UPDATE" >> "$GITHUB_ENV"
 
       - name: Sparkle-sign the zip
@@ -170,7 +190,7 @@ jobs:
             --notes-file /tmp/release_notes.md
 
       - name: Checkout gh-pages
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: gh-pages
           path: gh-pages
