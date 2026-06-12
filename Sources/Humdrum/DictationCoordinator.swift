@@ -197,6 +197,19 @@ final class DictationCoordinator: ObservableObject {
     /// doesn't collide with the global ⌥Space toggle (id: 1).
     private let pauseHotkey = HotkeyManager(id: 2)
 
+    /// Conditional hotkeys, only armed while the orb is up in toggle
+    /// mode. Press Return (or keypad Enter) to commit what you've said
+    /// so far and finish the session *immediately*, instead of waiting
+    /// out the silence countdown — which is where the orb would
+    /// otherwise keep listening and pick up background noise. Carbon
+    /// swallows the keystroke at the OS level while registered, so the
+    /// Return never leaks into the focused field (no stray newline /
+    /// form submit in the target app). Two instances because one
+    /// HotkeyManager binds one keyCode: id 3 for the main Return, id 4
+    /// for the numeric-keypad Enter.
+    private let finishHotkey = HotkeyManager(id: 3)
+    private let finishHotkeyKeypad = HotkeyManager(id: 4)
+
     /// PTT activation surface, used in place of `hotkey` when the
     /// user has set `activationMode = .pushToTalk`. Only one of
     /// `hotkey` / `pttMonitor` is installed at a time; see
@@ -701,6 +714,7 @@ final class DictationCoordinator: ObservableObject {
         if sessionActivation == .toggle {
             installPauseHotkey()
             installEscapeMonitor()
+            installFinishHotkey()
         }
 
         Diagnostics.dictation.info(
@@ -1193,6 +1207,51 @@ final class DictationCoordinator: ObservableObject {
         }
     }
 
+    /// Registers the Return / keypad-Enter "finish now" bindings on
+    /// `finishHotkey` / `finishHotkeyKeypad`. Both fire `finishNow()`,
+    /// which commits the pending tail and tears the orb down with the
+    /// same flush path as a ⌥Space stop — so the user can end a
+    /// dictation on their own beat instead of waiting out the silence
+    /// countdown (and the background noise the open mic picks up during
+    /// it). Carbon consumes the keystroke while the binding is live, so
+    /// Return doesn't also land in the focused field. Logs and
+    /// continues if either registration fails — finishing via ⌥Space
+    /// or silence still works.
+    private func installFinishHotkey() {
+        let handler: HotkeyManager.Handler = { [weak self] in
+            Task { @MainActor [weak self] in
+                await self?.finishNow()
+            }
+        }
+        let returnRegistered = finishHotkey.register(
+            keyCode: HotkeyManager.Key.returnKey,
+            modifiers: 0,
+            handler: handler
+        )
+        if !returnRegistered {
+            NSLog("[Humdrum] Finish hotkey Return could not be registered (likely owned by another app).")
+        }
+        let keypadRegistered = finishHotkeyKeypad.register(
+            keyCode: HotkeyManager.Key.keypadEnter,
+            modifiers: 0,
+            handler: handler
+        )
+        if !keypadRegistered {
+            NSLog("[Humdrum] Finish hotkey keypad-Enter could not be registered (likely owned by another app).")
+        }
+    }
+
+    /// Return-key handler. Commits whatever's been said and ends the
+    /// session immediately, reusing `stop(reason:)`'s tail-flush path so
+    /// nothing said since the last phase-1 commit is lost. Treated as a
+    /// `.hotkey` stop because it's an explicit, user-driven end —
+    /// identical teardown to tapping ⌥Space again.
+    private func finishNow() async {
+        guard isDictating else { return }
+        Diagnostics.dictation.info("session.finish.requested via=return")
+        await stop(reason: .hotkey)
+    }
+
     /// Installs both a global and a local NSEvent monitor for
     /// `keyDown` events matching the Escape key. The dictation panel
     /// is intentionally non-key (so the user's focused text field in
@@ -1227,6 +1286,8 @@ final class DictationCoordinator: ObservableObject {
     /// state). Called from both `stop()` and `cancel()`.
     private func teardownConditionalBindings() {
         pauseHotkey.unregister()
+        finishHotkey.unregister()
+        finishHotkeyKeypad.unregister()
         if let escapeMonitor {
             NSEvent.removeMonitor(escapeMonitor)
             self.escapeMonitor = nil
@@ -1355,6 +1416,8 @@ final class DictationCoordinator: ObservableObject {
     deinit {
         hotkey.unregister()
         pauseHotkey.unregister()
+        finishHotkey.unregister()
+        finishHotkeyKeypad.unregister()
         // PushToTalkMonitor's own deinit also rips its monitors, but
         // we explicitly tear ours down here for parity with the
         // toggle-mode hotkey teardown above. NSEvent.removeMonitor

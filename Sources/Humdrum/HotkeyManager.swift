@@ -44,8 +44,10 @@ final class HotkeyManager {
 
     /// Convenience keyCodes for space + common letters.
     enum Key {
-        static let space: UInt32 = UInt32(kVK_Space)         // 49
-        static let p:     UInt32 = UInt32(kVK_ANSI_P)        // 35
+        static let space:       UInt32 = UInt32(kVK_Space)            // 49
+        static let p:           UInt32 = UInt32(kVK_ANSI_P)          // 35
+        static let returnKey:   UInt32 = UInt32(kVK_Return)         // 36
+        static let keypadEnter: UInt32 = UInt32(kVK_ANSI_KeypadEnter) // 76
     }
 
     /// Registers the given hotkey. Replaces any previously registered

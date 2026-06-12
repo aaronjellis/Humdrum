@@ -88,10 +88,10 @@ This is a pragmatic streaming scheme: latency is bounded by the transcription in
 
 Settings → Dictation → **Activation** picks one:
 
-- **Toggle** (default) — Tap ⌥Space to start, tap again to stop. Phrases get pasted as you pause: ~0.5 s of trailing silence triggers a "phase-1 commit" that pastes the new tail into the focused field, and the engine keeps listening until you tap to stop or stay silent for the full silence-timeout (default 6 s).
+- **Toggle** (default) — Tap ⌥Space to start, tap again to stop. Phrases get pasted as you pause: ~0.5 s of trailing silence triggers a "phase-1 commit" that pastes the new tail into the focused field, and the engine keeps listening until you tap to stop, press **Return** to finish immediately, or stay silent for the full silence-timeout (default 6 s).
 - **Push-to-talk** — Hold ⌥Space while you speak, release to commit. The entire utterance is pasted as one chunk on release. No mid-hold pastes — PTT is for the "I want to say one thing and have it land" flow.
 
-Both modes share a Carbon hotkey registration on ⌥Space, so the OS routes the keystroke to Humdrum instead of inserting a non-breaking space into the focused field. Toggle additionally registers ⌥P (pause) and Escape (cancel) while the orb is up.
+Both modes share a Carbon hotkey registration on ⌥Space, so the OS routes the keystroke to Humdrum instead of inserting a non-breaking space into the focused field. Toggle additionally registers ⌥P (pause), Escape (cancel), and Return / keypad-Enter (finish now) while the orb is up.
 
 ### Paste cascade
 
@@ -107,6 +107,7 @@ The coordinator does a cheap post-paste AX read of the focused element's charact
 ### Pause / cancel / failure feedback
 
 - **⌥P** — Pause (toggle mode only). Engine stays hot, orb dims, no auto-stop fires while paused. Tap again to resume.
+- **Return / keypad-Enter** — Finish now (toggle mode only). Commits whatever you've said so far and tears the orb down immediately, instead of waiting out the silence countdown — so the open mic doesn't keep picking up background noise after you've stopped talking. Carbon swallows the keystroke while the orb is up, so the Return doesn't leak a stray newline into the focused field.
 - **Escape** — Cancel (toggle mode only). Orb flashes red and tears down without pasting whatever new tail accumulated since the last commit.
 - **Failure pill** — Below the orb. Surfaces missing Accessibility, paste failure (empty clipboard fallback), silent drop (Electron-style consume-but-drop), or a transient "Transcribing…" indicator while the tail Whisper pass runs after a long PTT release.
 
@@ -162,6 +163,7 @@ Each downloaded update is verified against the ed25519 public key in `Info.plist
 
 - `⌥Space` — Toggle dictation, or hold for push-to-talk (mode picked in Settings → Dictation). Global.
 - `⌥P` — Pause an in-flight toggle-mode dictation (engine stays hot, no auto-stop). Tap again to resume.
+- `Return` / keypad `Enter` — Finish an in-flight toggle-mode dictation immediately: commit what's been said and tear down, without waiting out the silence countdown.
 - `Escape` — Cancel an in-flight toggle-mode dictation without pasting the unflushed tail.
 - `⌘R` — Start / stop recording (in-app)
 - `⌘⇧C` — Copy transcript
@@ -182,7 +184,7 @@ Humdrum/
 │   ├── PasteCascade.swift                      Clipboard-first → keystroke fallback strategy
 │   ├── DictationActivationMode.swift           toggle vs. pushToTalk enum
 │   ├── NoiseFilterLevel.swift                  Off / Light / Normal / Strict thresholds
-│   ├── NoiseSanitizer.swift                    Whisper-hallucination filter ("Thanks for watching")
+│   ├── NoiseSanitizer.swift                    Whisper-hallucination filter ("Thanks for watching") + inline sound-tag stripping ("[BACKGROUND NOISE]")
 │   ├── FuzzyMatcher.swift                      Token-level diff for the corrections-store learning loop
 │   ├── TextChunker.swift                       Default chunk size for the dictation paste path
 │   ├── TranscriptDelta.swift                   Diff-paste utilities

@@ -135,12 +135,87 @@ final class NoiseSanitizerTests: XCTestCase {
         XCTAssertEqual(result, "Thanks for watching the demo yesterday.")
     }
 
-    func testEmbeddedMusicTagSurvives() {
+    // MARK: - Inline non-speech annotation stripping
+
+    func testEmbeddedSquareBracketTagStripped() {
+        // Whisper's bracketed sound tags get pulled out even when
+        // they're embedded in real speech — this is the dictation
+        // user's complaint ("[BACKGROUND NOISE] leaks into my text").
         let result = NoiseSanitizer.sanitize(
             "Intro [Music] then the interview",
             level: .normal
         )
-        XCTAssertEqual(result, "Intro [Music] then the interview")
+        XCTAssertEqual(result, "Intro then the interview")
+    }
+
+    func testBackgroundNoiseTagStrippedInline() {
+        let result = NoiseSanitizer.sanitize(
+            "Let's get started [BACKGROUND NOISE] with the agenda.",
+            level: .normal
+        )
+        XCTAssertEqual(result, "Let's get started with the agenda.")
+    }
+
+    func testBlankAudioTagStripped() {
+        XCTAssertEqual(
+            NoiseSanitizer.sanitize("[BLANK_AUDIO]", level: .normal),
+            ""
+        )
+    }
+
+    func testLeadingAnnotationStrippedAndPunctuationTidied() {
+        // The space the stripped tag leaves behind shouldn't strand a
+        // gap before the period.
+        let result = NoiseSanitizer.sanitize(
+            "The meeting is over [coughing].",
+            level: .normal
+        )
+        XCTAssertEqual(result, "The meeting is over.")
+    }
+
+    func testMusicNoteSpanStripped() {
+        let result = NoiseSanitizer.sanitize(
+            "Welcome back ♪ upbeat music ♪ to the show",
+            level: .normal
+        )
+        XCTAssertEqual(result, "Welcome back to the show")
+    }
+
+    func testDescriptorParentheticalStripped() {
+        let result = NoiseSanitizer.sanitize(
+            "So anyway (laughter) where were we",
+            level: .normal
+        )
+        XCTAssertEqual(result, "So anyway where were we")
+    }
+
+    func testGenuineParentheticalAsideSurvives() {
+        // A real dictated aside is NOT a sound descriptor and must
+        // survive — we only strip parentheticals that read as Whisper
+        // annotations.
+        let result = NoiseSanitizer.sanitize(
+            "Email me (I'll send the deck tomorrow) when you can",
+            level: .normal
+        )
+        XCTAssertEqual(
+            result,
+            "Email me (I'll send the deck tomorrow) when you can"
+        )
+    }
+
+    func testOffLevelPreservesInlineAnnotations() {
+        // .off is a strict passthrough — annotations and all.
+        XCTAssertEqual(
+            NoiseSanitizer.sanitize("Hello [BACKGROUND NOISE] world", level: .off),
+            "Hello [BACKGROUND NOISE] world"
+        )
+    }
+
+    func testStringThatIsEntirelyAnnotationsCollapsesToEmpty() {
+        XCTAssertEqual(
+            NoiseSanitizer.sanitize("[NOISE] (coughing) ♪", level: .normal),
+            ""
+        )
     }
 
     // MARK: - List hygiene

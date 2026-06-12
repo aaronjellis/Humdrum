@@ -1345,36 +1345,15 @@ final class TranscriptionManager: ObservableObject {
     }
 
     /// Static sanitizer used by the off-thread finalize path.
-    /// Mirrors `sanitize(_:)` exactly — filter-off returns the raw
-    /// trimmed input, filter-on drops known Whisper silence
-    /// hallucinations.
+    /// Delegates to the shared `NoiseSanitizer` so the dictation/meeting
+    /// pipeline gets the same hallucination drops AND inline non-speech
+    /// annotation stripping ("[BACKGROUND NOISE]", "(coughing)", "♪")
+    /// that the unit-tested core enforces.
     fileprivate nonisolated static func sanitizeStatic(
         _ raw: String?,
         noiseFilter: NoiseFilterLevel
     ) -> String {
-        let t = (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        if t.isEmpty { return "" }
-        if noiseFilter == .off { return t }
-        let lower = t.lowercased()
-        let bannedExact: Set<String> = [
-            "thanks for watching.",
-            "thanks for watching!",
-            "thank you for watching.",
-            "thank you for watching!",
-            "thank you.",
-            "thanks.",
-            "please subscribe.",
-            "subtitles by the amara.org community",
-            "you",
-            ".",
-            "♪",
-            "[music]",
-            "[silence]",
-            "(music)",
-            "(silence)"
-        ]
-        if bannedExact.contains(lower) { return "" }
-        return t
+        NoiseSanitizer.sanitize(raw, level: noiseFilter)
     }
 
     /// Static version of the transcript renderer used by the finalize
@@ -1400,33 +1379,13 @@ final class TranscriptionManager: ObservableObject {
         return out
     }
 
-    /// Strips Whisper's well-known silence hallucinations (only when a filter
-    /// level is active). We're deliberately conservative — only drop if the
-    /// ENTIRE output is one of these phrases.
+    /// Strips Whisper's well-known silence hallucinations and inline
+    /// non-speech sound annotations ("[BACKGROUND NOISE]", "(coughing)",
+    /// "♪") when a filter level is active. Delegates to the shared,
+    /// unit-tested `NoiseSanitizer` so the live path and the off-thread
+    /// finalize path (`sanitizeStatic`) stay in lockstep.
     private func sanitize(_ raw: String?) -> String {
-        let t = (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        if t.isEmpty { return "" }
-        if noiseFilterLevel == .off { return t }
-        let lower = t.lowercased()
-        let bannedExact: Set<String> = [
-            "thanks for watching.",
-            "thanks for watching!",
-            "thank you for watching.",
-            "thank you for watching!",
-            "thank you.",
-            "thanks.",
-            "please subscribe.",
-            "subtitles by the amara.org community",
-            "you",
-            ".",
-            "♪",
-            "[music]",
-            "[silence]",
-            "(music)",
-            "(silence)"
-        ]
-        if bannedExact.contains(lower) { return "" }
-        return t
+        NoiseSanitizer.sanitize(raw, level: noiseFilterLevel)
     }
 
     // MARK: View helpers
