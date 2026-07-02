@@ -1,7 +1,35 @@
 <?xml version='1.0' encoding='utf-8'?>
 <rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" version="2.0">
   <channel>
-    <item><title>Version 0.3.0</title><pubDate>Wed, 29 Apr 2026 20:06:37 +0000</pubDate><sparkle:version>0.3.0</sparkle:version><sparkle:shortVersionString>0.3.0</sparkle:shortVersionString><description><![CDATA[<h3>What&#x27;s new in v0.3.0</h3>
+    <item><title>Version 0.3.1</title><pubDate>Thu, 02 Jul 2026 21:56:06 +0000</pubDate><sparkle:version>0.3.1</sparkle:version><sparkle:shortVersionString>0.3.1</sparkle:shortVersionString><description><![CDATA[<h3>What&#x27;s new in v0.3.1</h3>
+<p>A focused fix for noise-tag hallucinations leaking into dictated text.</p>
+<p>### Mutter (push-to-talk dictation) &amp; Meeting recorder</p>
+<ul>
+  <li><strong>No more `[BLANK_AUDIO]` / `[MUSIC]` in your text.</strong> Whisper&#x27;s non-speech</li>
+</ul>
+<p>  annotation tags — `[BLANK_AUDIO]`, `[Music]`, `[inaudible]`, `(laughing)`,</p>
+<p>  `♪` and friends — are now stripped wherever they appear in the transcript,</p>
+<p>  not just when a slice was <em>only</em> a tag. &quot;send it to the team [BLANK_AUDIO]&quot;</p>
+<p>  now pastes as &quot;send it to the team&quot;. Bracketed spans are removed</p>
+<p>  unconditionally (Whisper only brackets annotations, never spoken words);</p>
+<p>  parenthesized spans are removed only when the content matches a known</p>
+<p>  annotation vocabulary, so real parenthetical words survive.</p>
+<ul>
+  <li><strong>Decorated hallucinations drop too.</strong> A silence hallucination wrapped in</li>
+</ul>
+<p>  tags (&quot;♪ Thanks for watching. ♪&quot;) is now recognized and dropped entirely.</p>
+<ul>
+  <li><strong>Noise filter Off is untouched.</strong> As before, the Off level shows exactly</li>
+</ul>
+<p>  what Whisper emitted, tags and all.</p>
+<p>### Under the hood</p>
+<ul>
+  <li>The hallucination filter now lives in one place (`HumdrumCore.NoiseSanitizer`,</li>
+</ul>
+<p>  fully unit-tested — 31 tests) instead of three drifting copies across the</p>
+<p>  live and finalize paths.</p>
+<p>---</p>
+<p><strong>Full Changelog</strong>: <a href="https://github.com/aaronjellis/Humdrum/commits/v0.3.1">https://github.com/aaronjellis/Humdrum/commits/v0.3.1</a></p>]]></description><enclosure sparkle:edSignature="vSz10yymsOclnONPY0T2vlF/YbMW/jFcpPTi/dRBM1mGaQgnKqg8Di1My7Ortt0G1AWORQ7tOHKE5cZcsXs5Bw==" length="139073131" url="https://github.com/aaronjellis/Humdrum/releases/download/v0.3.1/Humdrum.zip" type="application/octet-stream" /></item><item><title>Version 0.3.0</title><pubDate>Wed, 29 Apr 2026 20:06:37 +0000</pubDate><sparkle:version>0.3.0</sparkle:version><sparkle:shortVersionString>0.3.0</sparkle:shortVersionString><description><h3>What&#x27;s new in v0.3.0</h3>
 <p>A reliability-and-UX pass focused on the two recording paths.</p>
 <p>### Meeting recorder</p>
 <ul>
@@ -19,11 +47,11 @@
 <p>### Under the hood</p>
 <p>If you ever poke at Console for diagnostics, the audio pipeline is now fully instrumented (`audio.first_samples`, `audio.first_audible`, `audio.stalled`, `audio.configChange.*`). Almost every silent-failure mode is now visible in a single `log show` invocation.</p>
 <p>---</p>
-<p><strong>Full Changelog</strong>: <a href="https://github.com/aaronjellis/Humdrum/commits/v0.3.0">https://github.com/aaronjellis/Humdrum/commits/v0.3.0</a></p>]]></description><enclosure sparkle:edSignature="1Nq+d+UPBVzuvm3F4i/wJokXZh5lX9W62TZCpR7cWrGy48uA8M/bDq09PMDSWUNGNb4g2WpbeWj9hnzrUdjQBQ==" length="139071676" url="https://github.com/aaronjellis/Humdrum/releases/download/v0.3.0/Humdrum.zip" type="application/octet-stream" /></item><item><title>Version 0.2.1</title><pubDate>Mon, 27 Apr 2026 03:42:12 +0000</pubDate><sparkle:version>0.2.1</sparkle:version><sparkle:shortVersionString>0.2.1</sparkle:shortVersionString><description><h3>What&#x27;s new in v0.2.1</h3>
+<p><strong>Full Changelog</strong>: <a href="https://github.com/aaronjellis/Humdrum/commits/v0.3.0">https://github.com/aaronjellis/Humdrum/commits/v0.3.0</a></p></description><enclosure sparkle:edSignature="1Nq+d+UPBVzuvm3F4i/wJokXZh5lX9W62TZCpR7cWrGy48uA8M/bDq09PMDSWUNGNb4g2WpbeWj9hnzrUdjQBQ==" length="139071676" url="https://github.com/aaronjellis/Humdrum/releases/download/v0.3.0/Humdrum.zip" type="application/octet-stream" /></item><item><title>Version 0.2.1</title><pubDate>Mon, 27 Apr 2026 03:42:12 +0000</pubDate><sparkle:version>0.2.1</sparkle:version><sparkle:shortVersionString>0.2.1</sparkle:shortVersionString><description><h3>What's new in v0.2.1</h3>
 <p>A small polish release after v0.2.0.</p>
 <ul>
-  <li><strong>One version, clearly displayed.</strong> The About box (App menu → About Humdrum) now shows a single version number instead of <em>&quot;Version 0.2.0 (21.0)&quot;</em> with two confusing numbers side by side. The sidebar in the main window also reads from the bundle automatically — previously it held a hand-typed &quot;v0.1.0&quot; left over from before the project was renamed to Humdrum.</li>
-  <li><strong>Reliable auto-updates.</strong> The Sparkle update pipeline that v0.2.0 introduced is now battle-tested end-to-end. <strong>App menu → Check for Updates…</strong> lands cleanly, including the case where some v0.2.0 installs hit a spurious &quot;Update Error&quot; on first install.</li>
+  <li><strong>One version, clearly displayed.</strong> The About box (App menu → About Humdrum) now shows a single version number instead of <em>"Version 0.2.0 (21.0)"</em> with two confusing numbers side by side. The sidebar in the main window also reads from the bundle automatically — previously it held a hand-typed "v0.1.0" left over from before the project was renamed to Humdrum.</li>
+  <li><strong>Reliable auto-updates.</strong> The Sparkle update pipeline that v0.2.0 introduced is now battle-tested end-to-end. <strong>App menu → Check for Updates…</strong> lands cleanly, including the case where some v0.2.0 installs hit a spurious "Update Error" on first install.</li>
 </ul>
 <p>---</p>
 <p><strong>Full Changelog</strong>: <a href="https://github.com/aaronjellis/Humdrum/commits/v0.2.1">https://github.com/aaronjellis/Humdrum/commits/v0.2.1</a></p></description><enclosure sparkle:edSignature="TJ6WjVQ9XMLb1bJm/8M1Bt2Q3/S2EGjEhlpUo3jPWzgRFKa8Wxl+23AF755imZ9dJBRcMn4qK4UQUQb3wGBEDg==" length="139051612" url="https://github.com/aaronjellis/Humdrum/releases/download/v0.2.1/Humdrum.zip" type="application/octet-stream" /></item><title>Humdrum Updates</title>
