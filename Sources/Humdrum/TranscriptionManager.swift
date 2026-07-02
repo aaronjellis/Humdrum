@@ -1345,36 +1345,14 @@ final class TranscriptionManager: ObservableObject {
     }
 
     /// Static sanitizer used by the off-thread finalize path.
-    /// Mirrors `sanitize(_:)` exactly — filter-off returns the raw
-    /// trimmed input, filter-on drops known Whisper silence
-    /// hallucinations.
+    /// Mirrors `sanitize(_:)` exactly — both delegate to
+    /// `HumdrumCore.NoiseSanitizer`, which is a pure nonisolated
+    /// function, so live and finalize paths can never drift.
     fileprivate nonisolated static func sanitizeStatic(
         _ raw: String?,
         noiseFilter: NoiseFilterLevel
     ) -> String {
-        let t = (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        if t.isEmpty { return "" }
-        if noiseFilter == .off { return t }
-        let lower = t.lowercased()
-        let bannedExact: Set<String> = [
-            "thanks for watching.",
-            "thanks for watching!",
-            "thank you for watching.",
-            "thank you for watching!",
-            "thank you.",
-            "thanks.",
-            "please subscribe.",
-            "subtitles by the amara.org community",
-            "you",
-            ".",
-            "♪",
-            "[music]",
-            "[silence]",
-            "(music)",
-            "(silence)"
-        ]
-        if bannedExact.contains(lower) { return "" }
-        return t
+        NoiseSanitizer.sanitize(raw, level: noiseFilter)
     }
 
     /// Static version of the transcript renderer used by the finalize
@@ -1401,32 +1379,12 @@ final class TranscriptionManager: ObservableObject {
     }
 
     /// Strips Whisper's well-known silence hallucinations (only when a filter
-    /// level is active). We're deliberately conservative — only drop if the
-    /// ENTIRE output is one of these phrases.
+    /// level is active). Whole-slice hallucination phrases drop entirely;
+    /// non-speech annotation tags ([BLANK_AUDIO], [Music], (laughing), ♪)
+    /// are stripped wherever they appear. Logic lives in
+    /// `HumdrumCore.NoiseSanitizer` so it stays unit-tested.
     private func sanitize(_ raw: String?) -> String {
-        let t = (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-        if t.isEmpty { return "" }
-        if noiseFilterLevel == .off { return t }
-        let lower = t.lowercased()
-        let bannedExact: Set<String> = [
-            "thanks for watching.",
-            "thanks for watching!",
-            "thank you for watching.",
-            "thank you for watching!",
-            "thank you.",
-            "thanks.",
-            "please subscribe.",
-            "subtitles by the amara.org community",
-            "you",
-            ".",
-            "♪",
-            "[music]",
-            "[silence]",
-            "(music)",
-            "(silence)"
-        ]
-        if bannedExact.contains(lower) { return "" }
-        return t
+        NoiseSanitizer.sanitize(raw, level: noiseFilterLevel)
     }
 
     // MARK: View helpers
